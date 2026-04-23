@@ -71,11 +71,14 @@ public:
         llvm::InitializeAllAsmParsers();
         llvm::InitializeAllAsmPrinters();
 
-        auto targetTriple = llvm::sys::getDefaultTargetTriple();
-        module_->setTargetTriple(targetTriple);
+        // LLVM 18 Fix: Convert the string to an explicit llvm::Triple object
+        std::string targetTripleStr = llvm::sys::getDefaultTargetTriple();
+        llvm::Triple targetTriple(targetTripleStr); 
+        
+        module_->setTargetTriple(targetTriple.normalize());
 
         std::string error;
-        auto target = llvm::TargetRegistry::lookupTarget(targetTriple, error);
+        auto target = llvm::TargetRegistry::lookupTarget(targetTriple.normalize(), error);
         if (!target) {
             llvm::errs() << error;
             return false;
@@ -85,7 +88,9 @@ public:
         auto features = "";
         llvm::TargetOptions opt;
         auto rm = std::optional<llvm::Reloc::Model>(llvm::Reloc::PIC_);
-        auto targetMachine = target->createTargetMachine(targetTriple, cpu, features, opt, rm);
+        
+        // Pass the explicit llvm::Triple object to the factory method
+        auto targetMachine = target->createTargetMachine(targetTriple.normalize(), cpu, features, opt, rm);
 
         module_->setDataLayout(targetMachine->createDataLayout());
 
@@ -99,9 +104,6 @@ public:
 
         // 3. Run Emit Pass
         llvm::legacy::PassManager pass;
-        
-        // Note: For LLVM 18+, use llvm::CodeGenFileType::ObjectFile
-        // For older LLVM versions, use llvm::CGFT_ObjectFile
         auto fileType = llvm::CodeGenFileType::ObjectFile; 
 
         if (targetMachine->addPassesToEmitFile(pass, dest, nullptr, fileType)) {
