@@ -68,6 +68,9 @@ public:
     // =========================================================================
     // FEATURE 1: JIT EXECUTION (Run in memory instantly)
     // =========================================================================
+   // =========================================================================
+    // FEATURE 1: JIT EXECUTION (Run in memory instantly)
+    // =========================================================================
     int executeJIT() {
         llvm::InitializeNativeTarget();
         llvm::InitializeNativeTargetAsmPrinter();
@@ -94,8 +97,8 @@ public:
             return 1;
         }
 
-        // Cast the LLVM memory address to a native C++ function pointer and run it!
-        int (*mainFn)() = mainSym->getValue().toPtr<int (*)()>();
+        // Cast the LLVM ExecutorAddr directly to a native C++ function pointer and run it!
+        int (*mainFn)() = mainSym->toPtr<int (*)()>();
         
         std::cout << "\n[JIT Execution Started]\n";
         int result = mainFn();
