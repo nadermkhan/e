@@ -14,21 +14,21 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Install LLVM (Pre-built Binaries)
+      # Pulls the official Microsoft-compatible LLVM 18 binaries instantly.
       uses: KyleMayes/install-llvm-action@v2
       with:
         version: "18.1.6"
         env: true
 
-    - name: Verify LLVM Path (Debug)
-      run: |
-        echo "LLVM is installed at: $env:LLVM_PATH"
-        dir "$env:LLVM_PATH\lib\cmake\llvm"
-
     - name: Configure CMake
-      # By setting CMAKE_PREFIX_PATH, find_package(LLVM) will instantly succeed
-      run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$env:LLVM_PATH"
+      # Bypasses CMake's flaky Windows prefix search by pointing directly
+      # to the folder containing LLVMConfig.cmake. Uses GitHub native 
+      # variable expansion to avoid PowerShell string-escaping issues.
+      run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DLLVM_DIR="${{ env.LLVM_PATH }}/lib/cmake/llvm"
 
     - name: Build Toolchain
+      # Compiles evo.exe, uses it to generate ElegantParser.hpp, 
+      # and then compiles and links elegantc.exe against the LLVM backend.
       run: cmake --build build --config Release
 
     - name: Prepare Artifact Directory
