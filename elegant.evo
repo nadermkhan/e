@@ -2,10 +2,30 @@ Program "Program" = _ decls:Declaration* { return decls; };
 
 _ = [ \t\n\r]* ;
 
-Declaration "Declaration" = ImportDecl / ClassDecl / StructDecl / FuncDecl / PropertyDecl ;
+Declaration "Declaration" = ImportDecl / ExternDecl / ClassDecl / StructDecl / FuncDecl / PropertyDecl ;
 
 ImportDecl "Import" = "import" _ pkg_name:Identifier {
     return createArray(std::vector<EvoParser::Value>{ makeString("Import"), pkg_name });
+};
+
+ExternDecl "Extern Function" = "extern" _ "func" _ name:Identifier "(" _ params:ExternParamList? ")" _ returnType:ReturnType? {
+    return createArray(std::vector<EvoParser::Value>{ makeString("Extern"), name, params, returnType });
+};
+
+ExternParamList "Extern Parameters" = first:ExternParam rest:ExternParamRest* {
+    std::vector<EvoParser::Value> items;
+    items.push_back(first);
+    for (const auto& v : getArrayElements(rest)) items.push_back(v);
+    return createArray(items);
+};
+ExternParamRest = "," _ @ExternParam ;
+ExternParam "Extern Parameter" = "..." _ {
+    return createArray(std::vector<EvoParser::Value>{ makeNull(), makeString("..."), makeString("VarArg") });
+} / first:Identifier second:Identifier? ":" _ type:Type {
+    if (!EvoParser::isNull(second)) {
+        return createArray(std::vector<EvoParser::Value>{ first, second, type });
+    }
+    return createArray(std::vector<EvoParser::Value>{ makeNull(), first, type });
 };
 
 ClassDecl "Class Declaration" = ("public" _)? "class" _ name:Identifier superclass:InheritanceClause? "{" _ members:ClassMember* "}" _ {
@@ -38,7 +58,13 @@ FuncDecl "Function" = "func" _ name:Identifier "(" _ params:ParamList? ")" _ ret
     return createArray(std::vector<EvoParser::Value>{ makeString("Function"), name, params, returnType, body });
 };
 
-ParamList "Parameters" = @Param ("," _ Param)* ;
+ParamList "Parameters" = first:Param rest:ParamRest* {
+    std::vector<EvoParser::Value> items;
+    items.push_back(first);
+    for (const auto& v : getArrayElements(rest)) items.push_back(v);
+    return createArray(items);
+};
+ParamRest = "," _ @Param ;
 Param "Parameter" = first:Identifier second:Identifier? ":" _ type:Type {
     if (!EvoParser::isNull(second)) {
         return createArray(std::vector<EvoParser::Value>{ first, second, type });
@@ -78,7 +104,13 @@ CallExpr "Call" = target:PrimaryExpr "(" _ args:CallArgs? ")" _ {
     return createArray(std::vector<EvoParser::Value>{ makeString("Call"), target, args });
 };
 
-CallArgs "Call Arguments" = @CallArg ("," _ CallArg)* ;
+CallArgs "Call Arguments" = first:CallArg rest:CallArgRest* {
+    std::vector<EvoParser::Value> items;
+    items.push_back(first);
+    for (const auto& v : getArrayElements(rest)) items.push_back(v);
+    return createArray(items);
+};
+CallArgRest = "," _ @CallArg ;
 CallArg "Argument" = (Identifier ":" _)? @Expression ;
 
 BinaryExpr "Binary Operation" = left:PrimaryExpr op:Operator right:Expression {
