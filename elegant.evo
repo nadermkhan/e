@@ -1,43 +1,47 @@
-Program "Program" = decls:Declaration* ;
+Program "Program" = _ decls:Declaration* ;
+
+_ = [ \t\n\r]* ;
 
 Declaration "Declaration" = ImportDecl / ClassDecl / StructDecl / FuncDecl / PropertyDecl ;
 
-ImportDecl "Import" = "import" pkg_name:Identifier {
+ImportDecl "Import" = "import" _ pkg_name:Identifier {
     return createArray(std::vector<EvoParser::Value>{ makeString("Import"), pkg_name });
 };
 
-ClassDecl "Class Declaration" = "public"? "class" name:Identifier superclass:InheritanceClause? "{" members:ClassMember* "}" {
+ClassDecl "Class Declaration" = ("public" _)? "class" _ name:Identifier superclass:InheritanceClause? "{" _ members:ClassMember* "}" _ {
     return createArray(std::vector<EvoParser::Value>{ makeString("Class"), name, superclass, members });
 };
 
-StructDecl "Struct Declaration" = "public"? "struct" name:Identifier superclass:InheritanceClause? "{" members:ClassMember* "}" {
+StructDecl "Struct Declaration" = ("public" _)? "struct" _ name:Identifier superclass:InheritanceClause? "{" _ members:ClassMember* "}" _ {
     return createArray(std::vector<EvoParser::Value>{ makeString("Struct"), name, superclass, members });
 };
 
-InheritanceClause "Inheritance" = ":" @Identifier ("," Identifier)* ;
+InheritanceClause "Inheritance" = ":" _ @Identifier ("," _ Identifier)* ;
 
 ClassMember "Member" = PropertyDecl / FuncDecl / ViewBodyDecl ;
 
-PropertyDecl "Property" = mutability:("var" / "let") name:Identifier ":" type:Type annotation:DefaultValue? {
+PropertyDecl "Property" = mutability:Mutability name:Identifier ":" _ type:Type annotation:DefaultValue? {
     return createArray(std::vector<EvoParser::Value>{ makeString("Property"), mutability, name, type, annotation });
 };
 
-DefaultValue "Default Value" = "=" @Expression ;
+Mutability = @$ ("var" / "let") _ ;
 
-ViewBodyDecl "View Body" = "var" "body" ":" "some" "View" "{" views:Expression* "}" {
+DefaultValue "Default Value" = "=" _ @Expression ;
+
+ViewBodyDecl "View Body" = "var" _ "body" _ ":" _ "some" _ "View" _ "{" _ views:Expression* "}" _ {
     return createArray(std::vector<EvoParser::Value>{ makeString("ViewBody"), views });
 };
 
-FuncDecl "Function" = "func" name:Identifier "(" params:ParamList? ")" returnType:ReturnType? "{" body:Statement* "}" {
+FuncDecl "Function" = "func" _ name:Identifier "(" _ params:ParamList? ")" _ returnType:ReturnType? "{" _ body:Statement* "}" _ {
     return createArray(std::vector<EvoParser::Value>{ makeString("Function"), name, params, returnType, body });
 };
 
-ParamList "Parameters" = @Param ("," Param)* ;
-Param "Parameter" = label:Identifier? name:Identifier ":" type:Type {
+ParamList "Parameters" = @Param ("," _ Param)* ;
+Param "Parameter" = label:Identifier? name:Identifier ":" _ type:Type {
     return createArray(std::vector<EvoParser::Value>{ label, name, type });
 };
 
-ReturnType "Return Type" = "->" @Type ;
+ReturnType "Return Type" = "->" _ @Type ;
 
 Statement "Statement" = PropertyDecl / Assignment / ReturnStmt / Expression ;
 
@@ -45,57 +49,57 @@ Assignment "Assignment" = target:Identifier op:AssignOp val:Expression {
     return createArray(std::vector<EvoParser::Value>{ makeString("Assign"), op, target, val });
 };
 
-AssignOp "Assignment Operator" = "=" / "+=" / "-=" / "*=" / "/=" ;
+AssignOp "Assignment Operator" = @$ ( "+=" / "-=" / "*=" / "/=" / "=" ) _ ;
 
-ReturnStmt "Return" = "return" expr:Expression? {
+ReturnStmt "Return" = "return" _ expr:Expression? {
     return createArray(std::vector<EvoParser::Value>{ makeString("Return"), expr });
 };
 
 Expression "Expression" = ViewInstantiation / CallExpr / BinaryExpr / PrimaryExpr ;
 
-ViewInstantiation "UI Element" = name:Identifier "(" args:CallArgs? ")" "{" children:Expression* "}" {
+ViewInstantiation "UI Element" = name:Identifier "(" _ args:CallArgs? ")" _ "{" _ children:Expression* "}" _ {
     return createArray(std::vector<EvoParser::Value>{ makeString("ViewNode"), name, args, children });
 };
 
-CallExpr "Call" = target:Identifier "(" args:CallArgs? ")" {
+CallExpr "Call" = target:Identifier "(" _ args:CallArgs? ")" _ {
     return createArray(std::vector<EvoParser::Value>{ makeString("Call"), target, args });
 };
 
-CallArgs "Call Arguments" = @CallArg ("," CallArg)* ;
-CallArg "Argument" = (Identifier ":")? Expression ;
+CallArgs "Call Arguments" = @CallArg ("," _ CallArg)* ;
+CallArg "Argument" = (Identifier ":" _)? Expression ;
 
 BinaryExpr "Binary Operation" = left:PrimaryExpr op:Operator right:Expression {
     return createArray(std::vector<EvoParser::Value>{ makeString("Binary"), op, left, right });
 };
 
-PrimaryExpr "Primary" = Literal / MemberAccess / Identifier / "(" @Expression ")" ;
+PrimaryExpr "Primary" = Literal / MemberAccess / Identifier / "(" _ @Expression ")" _ ;
 
-MemberAccess "Member Access" = "self." prop:Identifier {
+MemberAccess "Member Access" = "self." _ prop:Identifier {
     return createArray(std::vector<EvoParser::Value>{ makeString("SelfAccess"), prop });
-} / base:Identifier "." prop:Identifier {
+} / base:Identifier "." _ prop:Identifier {
     return createArray(std::vector<EvoParser::Value>{ makeString("MemberAccess"), base, prop });
 };
 
-Type "Type" = Identifier ("?" / "!")? ; 
+Type "Type" = @Identifier ("?" _ / "!" _)? ; 
 
-Identifier "Identifier" = $ ( [a-zA-Z_] [a-zA-Z0-9_]* ) ;
+Identifier "Identifier" = @$ ( [a-zA-Z_] [a-zA-Z0-9_]* ) _ ;
 
-Operator "Operator" = $ ( "+" / "-" / "*" / "/" / "==" / "!=" / ">" / "<" / ">=" / "<=" ) ;
+Operator "Operator" = @$ ( "==" / "!=" / ">=" / "<=" / ">" / "<" / "+" / "-" / "*" / "/" ) _ ;
 
 Literal "Literal" = StringLiteral / FloatLiteral / IntLiteral / BoolLiteral ;
 
-StringLiteral "String" = '"' $ ( [^"]* ) '"' {
-    return createArray(std::vector<EvoParser::Value>{ makeString("String"), makeString(_text()) }); 
+StringLiteral "String" = '"' val:$([^"]*) '"' _ {
+    return createArray(std::vector<EvoParser::Value>{ makeString("String"), val }); 
 };
 
-FloatLiteral "Float" = $ ( [0-9]+ "." [0-9]+ ) {
-    return createArray(std::vector<EvoParser::Value>{ makeString("Float"), makeString(_text()) });
+FloatLiteral "Float" = val:$([0-9]+ "." [0-9]+) _ {
+    return createArray(std::vector<EvoParser::Value>{ makeString("Float"), val });
 };
 
-IntLiteral "Integer" = $ ( [0-9]+ ) {
-    return createArray(std::vector<EvoParser::Value>{ makeString("Int"), makeString(_text()) });
+IntLiteral "Integer" = val:$([0-9]+) _ {
+    return createArray(std::vector<EvoParser::Value>{ makeString("Int"), val });
 };
 
-BoolLiteral "Boolean" = ("true" / "false") {
-    return createArray(std::vector<EvoParser::Value>{ makeString("Bool"), makeString(_text()) });
+BoolLiteral "Boolean" = val:$("true" / "false") _ {
+    return createArray(std::vector<EvoParser::Value>{ makeString("Bool"), val });
 };
