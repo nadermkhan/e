@@ -1,0 +1,136 @@
+{
+    // =====================================================================
+    // Elegant V1 Grammar -> C++/WinRT AST Builder
+    // Injected directly into the EvoParser namespace
+    // =====================================================================
+    // Helper function to extract array elements safely within Evo's arena
+    std::vector<Value> extractElements(ParseContext& ctx, const Value& arr) {
+        std::vector<Value> res;
+        if (arr.type == ValueType::Array) {
+            auto view = ctx.getArrayElements(arr);
+            for (const auto& v : view) res.push_back(v);
+        }
+        return res;
+    }
+}
+
+// --- Entry Point ---
+Program "Program" = decls:Declaration* ;
+
+// --- Top Level Declarations ---
+Declaration "Declaration" = ImportDecl / ClassDecl / StructDecl / FuncDecl / PropertyDecl ;
+
+ImportDecl "Import" = "import" id:Identifier {
+    return createArray({ makeString("Import"), id });
+};
+
+ClassDecl "Class Declaration" = "public"? "class" name:Identifier superclass:InheritanceClause? "{" members:ClassMember* "}" {
+    return createArray({ 
+        makeString("Class"), 
+        name, 
+        superclass.value_or(makeNull()), 
+        members 
+    });
+};
+
+StructDecl "Struct Declaration" = "public"? "struct" name:Identifier superclass:InheritanceClause? "{" members:ClassMember* "}" {
+    return createArray({ makeString("Struct"), name, superclass.value_or(makeNull()), members });
+};
+
+InheritanceClause "Inheritance" = ":" @Identifier ("," Identifier)* ;
+
+// --- Class & Struct Members ---
+ClassMember "Member" = PropertyDecl / FuncDecl / ViewBodyDecl ;
+
+PropertyDecl "Property" = mutability:("var" / "let") name:Identifier ":" type:Type annotation:DefaultValue? {
+    return createArray({ makeString("Property"), mutability, name, type, annotation.value_or(makeNull()) });
+};
+
+DefaultValue "Default Value" = "=" @Expression ;
+
+// The killer feature: Declarative UI blocks mapping to WinUI
+ViewBodyDecl "View Body" = "var" "body" ":" "some" "View" "{" views:Expression* "}" {
+    return createArray({ makeString("ViewBody"), views });
+};
+
+FuncDecl "Function" = "func" name:Identifier "(" params:ParamList? ")" returnType:ReturnType? "{" body:Statement* "}" {
+    return createArray({ 
+        makeString("Function"), 
+        name, 
+        params.value_or(createArray({})), 
+        returnType.value_or(makeNull()), 
+        body 
+    });
+};
+
+ParamList "Parameters" = @Param ("," Param)* ;
+Param "Parameter" = label:Identifier? name:Identifier ":" type:Type {
+    return createArray({ label.value_or(makeNull()), name, type });
+};
+
+ReturnType "Return Type" = "->" @Type ;
+
+// --- Statements ---
+Statement "Statement" = PropertyDecl / Assignment / ReturnStmt / Expression ;
+
+Assignment "Assignment" = target:Identifier op:AssignOp val:Expression {
+    return createArray({ makeString("Assign"), op, target, val });
+};
+
+AssignOp "Assignment Operator" = "=" / "+=" / "-=" / "*=" / "/=" ;
+
+ReturnStmt "Return" = "return" @Expression? {
+    return createArray({ makeString("Return"), _1.value_or(makeNull()) });
+};
+
+// --- Expressions & Types ---
+Expression "Expression" = ViewInstantiation / CallExpr / BinaryExpr / PrimaryExpr ;
+
+// E.g., StackPanel { TextBlock("Hello") }
+ViewInstantiation "UI Element" = name:Identifier "(" args:CallArgs? ")" "{" children:Expression* "}" {
+    return createArray({ makeString("ViewNode"), name, args.value_or(makeNull()), children });
+};
+
+CallExpr "Call" = target:Identifier "(" args:CallArgs? ")" {
+    return createArray({ makeString("Call"), target, args.value_or(makeNull()) });
+};
+
+CallArgs "Call Arguments" = @CallArg ("," CallArg)* ;
+CallArg "Argument" = (Identifier ":")? Expression ;
+
+BinaryExpr "Binary Operation" = left:PrimaryExpr op:Operator right:Expression {
+    return createArray({ makeString("Binary"), op, left, right });
+};
+
+PrimaryExpr "Primary" = Literal / MemberAccess / Identifier / "(" @Expression ")" ;
+
+MemberAccess "Member Access" = "self." prop:Identifier {
+    return createArray({ makeString("SelfAccess"), prop });
+} / base:Identifier "." prop:Identifier {
+    return createArray({ makeString("MemberAccess"), base, prop });
+};
+
+Type "Type" = Identifier ("?" / "!")? ; // Quick support for Swift-style Optionals
+
+// --- Lexical Tokens ---
+Identifier "Identifier" = $ ( [a-zA-Z_] [a-zA-Z0-9_]* ) ;
+
+Operator "Operator" = $ ( "+" / "-" / "*" / "/" / "==" / "!=" / ">" / "<" / ">=" / "<=" ) ;
+
+Literal "Literal" = StringLiteral / FloatLiteral / IntLiteral / BoolLiteral ;
+
+StringLiteral "String" = '"' $ ( [^"]* ) '"' {
+    return createArray({ makeString("String"), _text }); 
+};
+
+FloatLiteral "Float" = $ ( [0-9]+ "." [0-9]+ ) {
+    return createArray({ makeString("Float"), _text });
+};
+
+IntLiteral "Integer" = $ ( [0-9]+ ) {
+    return createArray({ makeString("Int"), _text });
+};
+
+BoolLiteral "Boolean" = ("true" / "false") {
+    return createArray({ makeString("Bool"), _text });
+};
