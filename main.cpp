@@ -66,10 +66,7 @@ public:
     }
 
     // =========================================================================
-    // FEATURE 1: JIT EXECUTION (Run in memory instantly)
-    // =========================================================================
-   // =========================================================================
-    // FEATURE 1: JIT EXECUTION (Run in memory instantly)
+    // FEATURE 1: JIT EXECUTION
     // =========================================================================
     int executeJIT() {
         llvm::InitializeNativeTarget();
@@ -83,21 +80,22 @@ public:
         }
         auto jit = std::move(jitExpected.get());
 
-        // We must transfer ownership of our Module and Context into the JIT
+        // CRITICAL FIX: Inject the JIT's memory DataLayout into the module.
+        // This ensures the AST function "main" is properly translated to the Windows "_main" ABI.
+        module_->setDataLayout(jit->getDataLayout());
+
         auto tsm = llvm::orc::ThreadSafeModule(std::move(module_), std::move(context_));
         if (auto err = jit->addIRModule(std::move(tsm))) {
             llvm::errs() << "Failed to add IR module to JIT.\n";
             return 1;
         }
 
-        // Look up the "main" function we compiled
         auto mainSym = jit->lookup("main");
         if (!mainSym) {
             llvm::errs() << "Execution Error: Could not find a 'func main()' to execute.\n";
             return 1;
         }
 
-        // Cast the LLVM ExecutorAddr directly to a native C++ function pointer and run it!
         int (*mainFn)() = mainSym->toPtr<int (*)()>();
         
         std::cout << "\n[JIT Execution Started]\n";
@@ -108,7 +106,7 @@ public:
     }
 
     // =========================================================================
-    // FEATURE 2: AOT COMPILATION (Emit native .obj file)
+    // FEATURE 2: AOT COMPILATION
     // =========================================================================
     bool emitObjectFile(const std::string& filename) {
         llvm::InitializeNativeTarget();
@@ -234,7 +232,6 @@ int main(int argc, char** argv) {
     bool compileOnly = false;
     std::string input_file = "";
 
-    // Basic CLI parsing
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "-c") {
@@ -276,6 +273,8 @@ int main(int argc, char** argv) {
 
     if (!compileOnly) {
         // --- ROUTE 1: JIT EXECUTION ---
+        std::cout << "\n--- Generated LLVM IR ---\n";
+        compiler.dumpIR();
         return compiler.executeJIT();
     } else {
         // --- ROUTE 2: AOT BARE-METAL EXE GENERATION ---
@@ -286,8 +285,6 @@ int main(int argc, char** argv) {
             std::cout << "✅ Emitted native object: " << obj_file << "\n";
             std::cout << "🚀 Linking standalone executable...\n";
 
-            // We invoke the bundled LLVM Linker. 
-            // /nodefaultlib guarantees absolutely ZERO Microsoft/SDK bloat.
             std::string linkCmd = "lld-link.exe " + obj_file + " /entry:main /subsystem:console /nodefaultlib /out:" + exe_file;
             
             int linkRes = std::system(linkCmd.c_str());
