@@ -23,7 +23,8 @@
 #include <llvm/IR/LegacyPassManager.h>
 
 // === Evo Parser Header ===
-#include <ElegantParser.hpp>
+// Using angle brackets ensures we use the generated file in the build folder
+#include <ElegantParser.hpp> 
 
 namespace Elegant {
 
@@ -67,11 +68,10 @@ public:
         llvm::InitializeAllAsmParsers();
         llvm::InitializeAllAsmPrinters();
 
-        // LLVM 18 Fix: Explicit llvm::Triple 
+        // LLVM 18 Fix: We pass the explicit llvm::Triple object, without calling .normalize()
         std::string targetTripleStr = llvm::sys::getDefaultTargetTriple();
         llvm::Triple targetTriple(targetTripleStr);
         
-        // Pass the object directly, NOT a string
         module_->setTargetTriple(targetTriple);
 
         std::string error;
@@ -86,7 +86,6 @@ public:
         llvm::TargetOptions opt;
         auto rm = std::optional<llvm::Reloc::Model>(llvm::Reloc::PIC_);
         
-        // Pass the object directly here too
         auto targetMachine = target->createTargetMachine(targetTriple, cpu, features, opt, rm);
 
         module_->setDataLayout(targetMachine->createDataLayout());
