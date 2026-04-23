@@ -43,7 +43,6 @@ public:
     }
 
     void compile() {
-        // Iterate through top-level declarations
         auto declarations = ctx_.getArrayElements(ctx_.root);
         for (const auto& declVal : declarations) {
             auto declArr = ctx_.getArrayElements(declVal);
@@ -51,11 +50,9 @@ public:
 
             std::string_view nodeType = EvoParser::toString(declArr[0]);
             
-            // Phase 1: Support compiling Swift-like functions into LLVM functions
             if (nodeType == "Function") {
                 compileFunction(declArr);
             }
-            // (Class, Struct, and ViewBody will be added here as we implement the COM ABI)
         }
     }
 
@@ -63,22 +60,20 @@ public:
         module_->print(llvm::outs(), nullptr);
     }
 
-   bool emitObjectFile(const std::string& filename) {
-        // 1. Initialize Native Windows Target
+    bool emitObjectFile(const std::string& filename) {
         llvm::InitializeAllTargetInfos();
         llvm::InitializeAllTargets();
         llvm::InitializeAllTargetMCs();
         llvm::InitializeAllAsmParsers();
         llvm::InitializeAllAsmPrinters();
 
-        // Fix for LLVM 18 API: Explicitly construct an llvm::Triple object
+        // LLVM 18 Fix: Explicit llvm::Triple 
         std::string targetTripleStr = llvm::sys::getDefaultTargetTriple();
         llvm::Triple targetTriple(targetTripleStr);
         
-        module_->setTargetTriple(targetTriple);
+        module_->setTargetTriple(targetTriple.normalize());
 
         std::string error;
-        // Looking up the target can still safely accept the string (ignore the deprecation warning for now)
         auto target = llvm::TargetRegistry::lookupTarget(targetTripleStr, error);
         if (!target) {
             llvm::errs() << error;
@@ -90,12 +85,10 @@ public:
         llvm::TargetOptions opt;
         auto rm = std::optional<llvm::Reloc::Model>(llvm::Reloc::PIC_);
         
-        // Fix for LLVM 18 API: Pass the explicit llvm::Triple object here
-        auto targetMachine = target->createTargetMachine(targetTriple, cpu, features, opt, rm);
+        auto targetMachine = target->createTargetMachine(targetTriple.normalize(), cpu, features, opt, rm);
 
         module_->setDataLayout(targetMachine->createDataLayout());
 
-        // 2. Open File Stream
         std::error_code ec;
         llvm::raw_fd_ostream dest(filename, ec, llvm::sys::fs::OF_None);
         if (ec) {
@@ -103,7 +96,6 @@ public:
             return false;
         }
 
-        // 3. Run Emit Pass
         llvm::legacy::PassManager pass;
         auto fileType = llvm::CodeGenFileType::ObjectFile; 
 
@@ -121,23 +113,18 @@ private:
     llvm::Function* compileFunction(const EvoParser::ArrayView& funcNode) {
         std::string name = std::string(EvoParser::toString(funcNode[1]));
         
-        // V1 Shortcut: Assuming all functions return Int32 and take no args.
-        // Later, we will parse funcNode[2] (Params) and funcNode[3] (Return Type).
         llvm::FunctionType* ft = llvm::FunctionType::get(llvm::Type::getInt32Ty(*context_), false);
         llvm::Function* f = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, name, module_.get());
 
-        // Create the entry block for the function
         llvm::BasicBlock* bb = llvm::BasicBlock::Create(*context_, "entry", f);
         builder_->SetInsertPoint(bb);
         named_values_.clear();
 
-        // Compile the statements inside the function body
         auto bodyArr = ctx_.getArrayElements(funcNode[4]);
         for (const auto& stmt : bodyArr) {
             compileStatement(stmt);
         }
 
-        // Validate the generated code
         llvm::verifyFunction(*f);
         return f;
     }
@@ -181,11 +168,10 @@ private:
             
             if (!L || !R) return nullptr;
 
-            // Generate Native Machine Instructions based on the operator
             if (op == "+") return builder_->CreateAdd(L, R, "addtmp");
             if (op == "-") return builder_->CreateSub(L, R, "subtmp");
             if (op == "*") return builder_->CreateMul(L, R, "multmp");
-            if (op == "/") return builder_->CreateSDiv(L, R, "divtmp"); // Signed Division
+            if (op == "/") return builder_->CreateSDiv(L, R, "divtmp"); 
         }
 
         return nullptr;
@@ -213,7 +199,6 @@ int main(int argc, char** argv) {
 
     std::cout << "🚀 Compiling " << input_file << "...\n";
 
-    // 1. Lex & Parse via Evo
     EvoParser::Parser parser;
     EvoParser::ParseContext ctx;
     EvoParser::ParseError err;
@@ -224,7 +209,6 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // 2. Generate LLVM IR and emit the Object File
     std::string moduleName = std::filesystem::path(input_file).stem().string();
     Elegant::LLVMCompiler compiler(ctx, moduleName);
 
@@ -236,7 +220,6 @@ int main(int argc, char** argv) {
     std::string obj_file = moduleName + ".obj";
     if (compiler.emitObjectFile(obj_file)) {
         std::cout << "\n✅ Successfully emitted native object: " << obj_file << "\n";
-        std::cout << "   Run 'link.exe " << obj_file << " /entry:main' to build the executable.\n";
     } else {
         std::cerr << "\n❌ Failed to emit object file.\n";
         return 1;
