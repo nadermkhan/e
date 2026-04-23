@@ -23,7 +23,7 @@
 #include <llvm/IR/LegacyPassManager.h>
 
 // === Evo Parser Header ===
-#include "ElegantParser.hpp"
+#include <ElegantParser.hpp>
 
 namespace Elegant {
 
@@ -71,7 +71,8 @@ public:
         std::string targetTripleStr = llvm::sys::getDefaultTargetTriple();
         llvm::Triple targetTriple(targetTripleStr);
         
-        module_->setTargetTriple(targetTriple.normalize());
+        // Pass the object directly, NOT a string
+        module_->setTargetTriple(targetTriple);
 
         std::string error;
         auto target = llvm::TargetRegistry::lookupTarget(targetTripleStr, error);
@@ -85,7 +86,8 @@ public:
         llvm::TargetOptions opt;
         auto rm = std::optional<llvm::Reloc::Model>(llvm::Reloc::PIC_);
         
-        auto targetMachine = target->createTargetMachine(targetTriple.normalize(), cpu, features, opt, rm);
+        // Pass the object directly here too
+        auto targetMachine = target->createTargetMachine(targetTriple, cpu, features, opt, rm);
 
         module_->setDataLayout(targetMachine->createDataLayout());
 
