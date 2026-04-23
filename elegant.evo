@@ -1,23 +1,11 @@
 {
     // =====================================================================
     // Elegant V1 Grammar -> C++/WinRT AST Builder
-    // Injected directly into the EvoParser namespace
     // =====================================================================
-    // Helper function to extract array elements safely within Evo's arena
-    std::vector<Value> extractElements(ParseContext& ctx, const Value& arr) {
-        std::vector<Value> res;
-        if (arr.type == ValueType::Array) {
-            auto view = ctx.getArrayElements(arr);
-            for (const auto& v : view) res.push_back(v);
-        }
-        return res;
-    }
 }
 
-// --- Entry Point ---
 Program "Program" = decls:Declaration* ;
 
-// --- Top Level Declarations ---
 Declaration "Declaration" = ImportDecl / ClassDecl / StructDecl / FuncDecl / PropertyDecl ;
 
 ImportDecl "Import" = "import" id:Identifier {
@@ -25,52 +13,44 @@ ImportDecl "Import" = "import" id:Identifier {
 };
 
 ClassDecl "Class Declaration" = "public"? "class" name:Identifier superclass:InheritanceClause? "{" members:ClassMember* "}" {
-    return createArray({ 
-        makeString("Class"), 
-        name, 
-        superclass.value_or(makeNull()), 
-        members 
-    });
+    Value sc = superclass.has_value() ? superclass.value() : makeNull();
+    return createArray({ makeString("Class"), name, sc, members });
 };
 
 StructDecl "Struct Declaration" = "public"? "struct" name:Identifier superclass:InheritanceClause? "{" members:ClassMember* "}" {
-    return createArray({ makeString("Struct"), name, superclass.value_or(makeNull()), members });
+    Value sc = superclass.has_value() ? superclass.value() : makeNull();
+    return createArray({ makeString("Struct"), name, sc, members });
 };
 
 InheritanceClause "Inheritance" = ":" @Identifier ("," Identifier)* ;
 
-// --- Class & Struct Members ---
 ClassMember "Member" = PropertyDecl / FuncDecl / ViewBodyDecl ;
 
 PropertyDecl "Property" = mutability:("var" / "let") name:Identifier ":" type:Type annotation:DefaultValue? {
-    return createArray({ makeString("Property"), mutability, name, type, annotation.value_or(makeNull()) });
+    Value ann = annotation.has_value() ? annotation.value() : makeNull();
+    return createArray({ makeString("Property"), mutability, name, type, ann });
 };
 
 DefaultValue "Default Value" = "=" @Expression ;
 
-// The killer feature: Declarative UI blocks mapping to WinUI
 ViewBodyDecl "View Body" = "var" "body" ":" "some" "View" "{" views:Expression* "}" {
     return createArray({ makeString("ViewBody"), views });
 };
 
 FuncDecl "Function" = "func" name:Identifier "(" params:ParamList? ")" returnType:ReturnType? "{" body:Statement* "}" {
-    return createArray({ 
-        makeString("Function"), 
-        name, 
-        params.value_or(createArray({})), 
-        returnType.value_or(makeNull()), 
-        body 
-    });
+    Value p = params.has_value() ? params.value() : createArray({});
+    Value rt = returnType.has_value() ? returnType.value() : makeNull();
+    return createArray({ makeString("Function"), name, p, rt, body });
 };
 
 ParamList "Parameters" = @Param ("," Param)* ;
 Param "Parameter" = label:Identifier? name:Identifier ":" type:Type {
-    return createArray({ label.value_or(makeNull()), name, type });
+    Value lbl = label.has_value() ? label.value() : makeNull();
+    return createArray({ lbl, name, type });
 };
 
 ReturnType "Return Type" = "->" @Type ;
 
-// --- Statements ---
 Statement "Statement" = PropertyDecl / Assignment / ReturnStmt / Expression ;
 
 Assignment "Assignment" = target:Identifier op:AssignOp val:Expression {
@@ -79,20 +59,21 @@ Assignment "Assignment" = target:Identifier op:AssignOp val:Expression {
 
 AssignOp "Assignment Operator" = "=" / "+=" / "-=" / "*=" / "/=" ;
 
-ReturnStmt "Return" = "return" @Expression? {
-    return createArray({ makeString("Return"), _1.value_or(makeNull()) });
+ReturnStmt "Return" = "return" expr:Expression? {
+    Value ex = expr.has_value() ? expr.value() : makeNull();
+    return createArray({ makeString("Return"), ex });
 };
 
-// --- Expressions & Types ---
 Expression "Expression" = ViewInstantiation / CallExpr / BinaryExpr / PrimaryExpr ;
 
-// E.g., StackPanel { TextBlock("Hello") }
 ViewInstantiation "UI Element" = name:Identifier "(" args:CallArgs? ")" "{" children:Expression* "}" {
-    return createArray({ makeString("ViewNode"), name, args.value_or(makeNull()), children });
+    Value a = args.has_value() ? args.value() : makeNull();
+    return createArray({ makeString("ViewNode"), name, a, children });
 };
 
 CallExpr "Call" = target:Identifier "(" args:CallArgs? ")" {
-    return createArray({ makeString("Call"), target, args.value_or(makeNull()) });
+    Value a = args.has_value() ? args.value() : makeNull();
+    return createArray({ makeString("Call"), target, a });
 };
 
 CallArgs "Call Arguments" = @CallArg ("," CallArg)* ;
@@ -110,9 +91,8 @@ MemberAccess "Member Access" = "self." prop:Identifier {
     return createArray({ makeString("MemberAccess"), base, prop });
 };
 
-Type "Type" = Identifier ("?" / "!")? ; // Quick support for Swift-style Optionals
+Type "Type" = Identifier ("?" / "!")? ; 
 
-// --- Lexical Tokens ---
 Identifier "Identifier" = $ ( [a-zA-Z_] [a-zA-Z0-9_]* ) ;
 
 Operator "Operator" = $ ( "+" / "-" / "*" / "/" / "==" / "!=" / ">" / "<" / ">=" / "<=" ) ;
@@ -120,17 +100,17 @@ Operator "Operator" = $ ( "+" / "-" / "*" / "/" / "==" / "!=" / ">" / "<" / ">="
 Literal "Literal" = StringLiteral / FloatLiteral / IntLiteral / BoolLiteral ;
 
 StringLiteral "String" = '"' $ ( [^"]* ) '"' {
-    return createArray({ makeString("String"), _text }); 
+    return createArray({ makeString("String"), makeString(std::string(_text)) }); 
 };
 
 FloatLiteral "Float" = $ ( [0-9]+ "." [0-9]+ ) {
-    return createArray({ makeString("Float"), _text });
+    return createArray({ makeString("Float"), makeString(std::string(_text)) });
 };
 
 IntLiteral "Integer" = $ ( [0-9]+ ) {
-    return createArray({ makeString("Int"), _text });
+    return createArray({ makeString("Int"), makeString(std::string(_text)) });
 };
 
 BoolLiteral "Boolean" = ("true" / "false") {
-    return createArray({ makeString("Bool"), _text });
+    return createArray({ makeString("Bool"), makeString(std::string(_text)) });
 };
