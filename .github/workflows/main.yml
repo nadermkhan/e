@@ -13,32 +13,41 @@ jobs:
     - name: Checkout Repository
       uses: actions/checkout@v4
 
-    - name: Install LLVM (Pre-built Binaries)
-      # Pulls the official Microsoft-compatible LLVM 18 binaries instantly.
-      uses: KyleMayes/install-llvm-action@v2
+    - name: Setup Native Windows Environment (MSYS2 UCRT64)
+      # This provides a lightning-fast package manager for Windows native binaries.
+      uses: msys2/setup-msys2@v2
       with:
-        version: "18.1.6"
-        env: true
+        msystem: UCRT64
+        update: true
+        install: >-
+          mingw-w64-ucrt-x86_64-toolchain
+          mingw-w64-ucrt-x86_64-cmake
+          mingw-w64-ucrt-x86_64-ninja
+          mingw-w64-ucrt-x86_64-llvm
 
     - name: Configure CMake
-      # Bypasses CMake's flaky Windows prefix search by pointing directly
-      # to the folder containing LLVMConfig.cmake. Uses GitHub native 
-      # variable expansion to avoid PowerShell string-escaping issues.
-      run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DLLVM_DIR="${{ env.LLVM_PATH }}/lib/cmake/llvm"
+      # Run inside the MSYS2 shell. find_package(LLVM) works automatically here!
+      shell: msys2 {0}
+      run: cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release
 
     - name: Build Toolchain
-      # Compiles evo.exe, uses it to generate ElegantParser.hpp, 
-      # and then compiles and links elegantc.exe against the LLVM backend.
-      run: cmake --build build --config Release
+      shell: msys2 {0}
+      run: cmake --build build
 
-    - name: Prepare Artifact Directory
+    - name: Prepare Standalone Artifact
+      shell: msys2 {0}
       run: |
         mkdir ElegantRelease
-        copy build\Release\elegantc.exe ElegantRelease\
+        cp build/elegantc.exe ElegantRelease/
+        
+        echo "Bundling required DLLs so the executable is portable..."
+        # This brilliantly finds any dynamic libraries (like libLLVM.dll) that your 
+        # compiler needs and copies them into the release folder.
+        ldd build/elegantc.exe | grep "ucrt64" | awk '{print $3}' | xargs -I '{}' cp '{}' ElegantRelease/
         
     - name: Upload Compiler Artifact
       uses: actions/upload-artifact@v4
       with:
         name: Elegant-Compiler-Windows-x64
-        path: ElegantRelease\*
+        path: ElegantRelease/*
         compression-level: 9
