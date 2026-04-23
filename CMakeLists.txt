@@ -4,18 +4,18 @@ project(ElegantCompiler LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# 1. Find the LLVM package downloaded by GitHub Actions
+# 1. Find LLVM
 find_package(LLVM REQUIRED CONFIG)
 message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
 message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 
 include_directories(${LLVM_INCLUDE_DIRS})
-add_definitions(${LLVM_DEFINITIONS})
+# REMOVED: add_definitions(${LLVM_DEFINITIONS}) -> This was causing the MSYS2 stray quote bug
 
-# 2. Build the Evo Parser Generator
+# 2. Build the Evo Parser Generator (No LLVM needed for this!)
 add_executable(evo evo.cpp)
 
-# 3. Custom Command: Run evo to generate ElegantParser.hpp before building the compiler
+# 3. Custom Command: Run evo to generate ElegantParser.hpp
 add_custom_command(
     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/ElegantParser.hpp
     COMMAND evo ${CMAKE_CURRENT_SOURCE_DIR}/elegant.evo -o ${CMAKE_CURRENT_BINARY_DIR}/ElegantParser.hpp
@@ -26,7 +26,7 @@ add_custom_command(
 # 4. Build the actual Elegant Compiler (elegantc)
 add_executable(elegantc main.cpp ${CMAKE_CURRENT_BINARY_DIR}/ElegantParser.hpp)
 
-# Tell CMake to link the specific LLVM modules your JIT/AOT compiler needs
+# Tell CMake to link the specific LLVM modules
 llvm_map_components_to_libnames(llvm_libs Core ExecutionEngine OrcJIT Support Target native)
 target_link_libraries(elegantc PRIVATE ${llvm_libs})
 
