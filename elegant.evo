@@ -2,8 +2,8 @@ Program "Program" = decls:Declaration* ;
 
 Declaration "Declaration" = ImportDecl / ClassDecl / StructDecl / FuncDecl / PropertyDecl ;
 
-ImportDecl "Import" = "import" import_id:Identifier {
-    return createArray(std::vector<EvoParser::Value>{ makeString("Import"), import_id });
+ImportDecl "Import" = "import" pkg_name:Identifier {
+    return createArray(std::vector<EvoParser::Value>{ makeString("Import"), pkg_name });
 };
 
 ClassDecl "Class Declaration" = "public"? "class" name:Identifier superclass:InheritanceClause? "{" members:ClassMember* "}" {
