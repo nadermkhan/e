@@ -1545,8 +1545,11 @@ private:
             line("Value " + name + "_val = makeNull();");
             line("{");
             indent_++;
-            line("size_t rep_start = arena_.head;");
-            line("size_t rep_count = 0;");
+            // Collect child values in a local buffer first. The child parser may
+            // allocate into the arena itself, so we cannot reserve a contiguous
+            // arena range up front; copy into the arena only after all iterations
+            // complete to guarantee elements are contiguous.
+            line("std::vector<Value> rep_items;");
             line("for (;;) {");
             indent_++;
             line("size_t rc = 0, rl = 0, rco = 0, rar = 0;");
@@ -1554,13 +1557,13 @@ private:
             std::string child_res = emitExpr(*n.child);
             line("if (!" + child_res + "_ok) { restore(rc, rl, rco, rar); break; }");
             line("if (cursor_ == rc) { restore(rc, rl, rco, rar); break; } // Prevent loop & leak");
-            line("arena_.push_back(" + child_res + "_val);");
-            line("rep_count++;");
+            line("rep_items.push_back(" + child_res + "_val);");
             indent_--;
             line("}");
+            line("size_t rep_start = arena_.allocate(rep_items);");
             line(name + "_val.type = ValueType::Array;");
             line(name + "_val.data.arr.arena_start = rep_start;");
-            line(name + "_val.data.arr.length = static_cast<uint32_t>(rep_count);");
+            line(name + "_val.data.arr.length = static_cast<uint32_t>(rep_items.size());");
             indent_--;
             line("}");
         } else if (n.kind == RepKind::OneOrMore) {
@@ -1568,13 +1571,11 @@ private:
             line("Value " + name + "_val = makeNull();");
             line("{");
             indent_++;
-            line("size_t rep_start = arena_.head;");
-            line("size_t rep_count = 0;");
+            line("std::vector<Value> rep_items;");
             std::string first = emitExpr(*n.child);
             line("if (" + first + "_ok) {");
             indent_++;
-            line("arena_.push_back(" + first + "_val);");
-            line("rep_count++;");
+            line("rep_items.push_back(" + first + "_val);");
             line("for (;;) {");
             indent_++;
             line("size_t rc = 0, rl = 0, rco = 0, rar = 0;");
@@ -1582,14 +1583,14 @@ private:
             std::string next = emitExpr(*n.child);
             line("if (!" + next + "_ok) { restore(rc, rl, rco, rar); break; }");
             line("if (cursor_ == rc) { restore(rc, rl, rco, rar); break; } // Prevent loop & leak");
-            line("arena_.push_back(" + next + "_val);");
-            line("rep_count++;");
+            line("rep_items.push_back(" + next + "_val);");
             indent_--;
             line("}");
+            line("size_t rep_start = arena_.allocate(rep_items);");
             line(name + "_ok = true;");
             line(name + "_val.type = ValueType::Array;");
             line(name + "_val.data.arr.arena_start = rep_start;");
-            line(name + "_val.data.arr.length = static_cast<uint32_t>(rep_count);");
+            line(name + "_val.data.arr.length = static_cast<uint32_t>(rep_items.size());");
             indent_--;
             line("}"); // Close the successful 'if' block. No empty else needed.
             indent_--;
