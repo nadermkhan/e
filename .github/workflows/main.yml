@@ -14,7 +14,6 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Setup Native Windows Environment (MSYS2 UCRT64)
-      # This provides a lightning-fast package manager for Windows native binaries.
       uses: msys2/setup-msys2@v2
       with:
         msystem: UCRT64
@@ -24,9 +23,9 @@ jobs:
           mingw-w64-ucrt-x86_64-cmake
           mingw-w64-ucrt-x86_64-ninja
           mingw-w64-ucrt-x86_64-llvm
+          mingw-w64-ucrt-x86_64-lld
 
     - name: Configure CMake
-      # Run inside the MSYS2 shell. find_package(LLVM) works automatically here!
       shell: msys2 {0}
       run: cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release
 
@@ -38,12 +37,14 @@ jobs:
       shell: msys2 {0}
       run: |
         mkdir ElegantRelease
-        cp build/elegantc.exe ElegantRelease/
         
-        echo "Bundling required DLLs so the executable is portable..."
-        # This brilliantly finds any dynamic libraries (like libLLVM.dll) that your 
-        # compiler needs and copies them into the release folder.
+        echo "Copying Compiler and Linker..."
+        cp build/elegantc.exe ElegantRelease/
+        cp /ucrt64/bin/lld-link.exe ElegantRelease/
+        
+        echo "Bundling required DLLs for true zero-dependency portability..."
         ldd build/elegantc.exe | grep "ucrt64" | awk '{print $3}' | xargs -I '{}' cp '{}' ElegantRelease/
+        ldd /ucrt64/bin/lld-link.exe | grep "ucrt64" | awk '{print $3}' | xargs -I '{}' cp -n '{}' ElegantRelease/
         
     - name: Upload Compiler Artifact
       uses: actions/upload-artifact@v4

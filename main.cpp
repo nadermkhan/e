@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <memory>
 #include <system_error>
+#include <cstdlib>
 
 // === LLVM Headers ===
 #include <llvm/IR/LLVMContext.h>
@@ -21,6 +22,10 @@
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/Target/TargetOptions.h>
 #include <llvm/IR/LegacyPassManager.h>
+
+// === LLVM ORC JIT Headers ===
+#include <llvm/ExecutionEngine/Orc/LLJIT.h>
+#include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
 
 // === Evo Parser Header ===
 #include <ElegantParser.hpp> 
@@ -60,15 +65,55 @@ public:
         module_->print(llvm::outs(), nullptr);
     }
 
+    // =========================================================================
+    // FEATURE 1: JIT EXECUTION (Run in memory instantly)
+    // =========================================================================
+    int executeJIT() {
+        llvm::InitializeNativeTarget();
+        llvm::InitializeNativeTargetAsmPrinter();
+        llvm::InitializeNativeTargetAsmParser();
+
+        auto jitExpected = llvm::orc::LLJITBuilder().create();
+        if (!jitExpected) {
+            llvm::errs() << "Failed to create JIT engine.\n";
+            return 1;
+        }
+        auto jit = std::move(jitExpected.get());
+
+        // We must transfer ownership of our Module and Context into the JIT
+        auto tsm = llvm::orc::ThreadSafeModule(std::move(module_), std::move(context_));
+        if (auto err = jit->addIRModule(std::move(tsm))) {
+            llvm::errs() << "Failed to add IR module to JIT.\n";
+            return 1;
+        }
+
+        // Look up the "main" function we compiled
+        auto mainSym = jit->lookup("main");
+        if (!mainSym) {
+            llvm::errs() << "Execution Error: Could not find a 'func main()' to execute.\n";
+            return 1;
+        }
+
+        // Cast the LLVM memory address to a native C++ function pointer and run it!
+        int (*mainFn)() = mainSym->getValue().toPtr<int (*)()>();
+        
+        std::cout << "\n[JIT Execution Started]\n";
+        int result = mainFn();
+        std::cout << "[JIT Exit Code]: " << result << "\n";
+        
+        return result;
+    }
+
+    // =========================================================================
+    // FEATURE 2: AOT COMPILATION (Emit native .obj file)
+    // =========================================================================
     bool emitObjectFile(const std::string& filename) {
-        // LINKER FIX: Only initialize the native system architecture (x86_64)
         llvm::InitializeNativeTarget();
         llvm::InitializeNativeTargetAsmParser();
         llvm::InitializeNativeTargetAsmPrinter();
 
         std::string targetTripleStr = llvm::sys::getDefaultTargetTriple();
         llvm::Triple targetTriple(targetTripleStr);
-        
         module_->setTargetTriple(targetTriple);
 
         std::string error;
@@ -82,7 +127,6 @@ public:
         auto features = "";
         llvm::TargetOptions opt;
         auto rm = std::optional<llvm::Reloc::Model>(llvm::Reloc::PIC_);
-        
         auto targetMachine = target->createTargetMachine(targetTriple, cpu, features, opt, rm);
 
         module_->setDataLayout(targetMachine->createDataLayout());
@@ -95,9 +139,7 @@ public:
         }
 
         llvm::legacy::PassManager pass;
-        auto fileType = llvm::CodeGenFileType::ObjectFile; 
-
-        if (targetMachine->addPassesToEmitFile(pass, dest, nullptr, fileType)) {
+        if (targetMachine->addPassesToEmitFile(pass, dest, nullptr, llvm::CodeGenFileType::ObjectFile)) {
             llvm::errs() << "TargetMachine can't emit a file of this type";
             return false;
         }
@@ -180,11 +222,30 @@ private:
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::cerr << "Usage: elegantc <input.ele>\n";
+        std::cout << "Elegant Compiler Toolchain\n";
+        std::cout << "Usage (JIT): elegantc <file.ele>\n";
+        std::cout << "Usage (AOT): elegantc -c <file.ele>\n";
         return 1;
     }
 
-    std::string input_file = argv[1];
+    bool compileOnly = false;
+    std::string input_file = "";
+
+    // Basic CLI parsing
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "-c") {
+            compileOnly = true;
+        } else {
+            input_file = arg;
+        }
+    }
+
+    if (input_file.empty()) {
+        std::cerr << "Error: No input file specified.\n";
+        return 1;
+    }
+
     std::ifstream ifs(input_file);
     if (!ifs) {
         std::cerr << "Error: Cannot open '" << input_file << "'\n";
@@ -194,8 +255,6 @@ int main(int argc, char** argv) {
     std::ostringstream ss;
     ss << ifs.rdbuf();
     std::string source = ss.str();
-
-    std::cout << "🚀 Compiling " << input_file << "...\n";
 
     EvoParser::Parser parser;
     EvoParser::ParseContext ctx;
@@ -212,15 +271,29 @@ int main(int argc, char** argv) {
 
     compiler.compile();
 
-    std::cout << "\n--- Generated LLVM IR ---\n";
-    compiler.dumpIR();
-
-    std::string obj_file = moduleName + ".obj";
-    if (compiler.emitObjectFile(obj_file)) {
-        std::cout << "\n✅ Successfully emitted native object: " << obj_file << "\n";
+    if (!compileOnly) {
+        // --- ROUTE 1: JIT EXECUTION ---
+        return compiler.executeJIT();
     } else {
-        std::cerr << "\n❌ Failed to emit object file.\n";
-        return 1;
+        // --- ROUTE 2: AOT BARE-METAL EXE GENERATION ---
+        std::string obj_file = moduleName + ".obj";
+        std::string exe_file = moduleName + ".exe";
+
+        if (compiler.emitObjectFile(obj_file)) {
+            std::cout << "✅ Emitted native object: " << obj_file << "\n";
+            std::cout << "🚀 Linking standalone executable...\n";
+
+            // We invoke the bundled LLVM Linker. 
+            // /nodefaultlib guarantees absolutely ZERO Microsoft/SDK bloat.
+            std::string linkCmd = "lld-link.exe " + obj_file + " /entry:main /subsystem:console /nodefaultlib /out:" + exe_file;
+            
+            int linkRes = std::system(linkCmd.c_str());
+            if (linkRes == 0) {
+                std::cout << "✅ Success! Built zero-dependency executable: " << exe_file << "\n";
+            } else {
+                std::cerr << "❌ Linker failed. Ensure lld-link.exe is present.\n";
+            }
+        }
     }
 
     return 0;
