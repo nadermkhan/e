@@ -1,0 +1,46 @@
+name: Build Elegant Compiler (Windows)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch: # Allows you to trigger the build manually from the GitHub UI
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Install LLVM (Dev Libraries)
+      # We use vcpkg (which comes pre-installed on GitHub Windows runners) 
+      # to pull the LLVM libraries required for your C++ compiler backend.
+      run: |
+        vcpkg install llvm:x64-windows
+        vcpkg integrate install
+      
+    - name: Configure CMake
+      # Assuming you will use CMake to manage the C++ build
+      run: >
+        cmake -B build -S . 
+        -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+        -DCMAKE_BUILD_TYPE=Release
+
+    - name: Build Toolchain
+      # This step compiles evo.exe, runs it to generate ElegantParser.hpp, 
+      # and then compiles elegantc.exe linking against LLVM.
+      run: cmake --build build --config Release
+
+    - name: Prepare Artifact Directory
+      run: |
+        mkdir ElegantRelease
+        copy build\Release\elegantc.exe ElegantRelease\
+        # If your compiler needs specific LLVM DLLs, copy them here too
+        
+    - name: Upload Compiler Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: Elegant-Compiler-Windows-x64
+        path: ElegantRelease\*
+        compression-level: 9 # Max compression for the zip
