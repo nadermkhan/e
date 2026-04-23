@@ -1,0 +1,18 @@
+func calculate(start: Int) -> Int {
+    var sum = start
+    var i = 0
+
+    while i < 5 {
+        if i == 3 {
+            sum = sum + 100
+        } else {
+            sum = sum + 1
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+func main() -> Int {
+    return calculate(start: 10)
+}
