@@ -38,16 +38,7 @@ FuncDecl "Function" = "func" _ name:Identifier "(" _ params:ParamList? ")" _ ret
     return createArray(std::vector<EvoParser::Value>{ makeString("Function"), name, params, returnType, body });
 };
 
-ParamList "Parameters" = head:Param tail:ParamRest* {
-    std::vector<EvoParser::Value> out;
-    out.push_back(head);
-    auto tailArr = getArrayElements(tail);
-    for (size_t i = 0; i < tailArr.size; ++i) out.push_back(tailArr[i]);
-    return createArray(out);
-};
-
-ParamRest = "," _ @Param ;
-
+ParamList "Parameters" = @Param ("," _ Param)* ;
 Param "Parameter" = first:Identifier second:Identifier? ":" _ type:Type {
     if (!EvoParser::isNull(second)) {
         return createArray(std::vector<EvoParser::Value>{ first, second, type });
@@ -59,19 +50,15 @@ ReturnType "Return Type" = "->" _ @Type ;
 
 Statement "Statement" = PropertyDecl / Assignment / ReturnStmt / IfStmt / WhileStmt / Expression ;
 
-IfStmt "If Statement" = "if" _ cond:Expression "{" _ then_body:Statement* "}" _ else_body:ElseClause? {
+IfStmt "If Statement" = "if" _ cond:Expression "{" _ then_body:Statement* "}" _ else_body:("else" _ "{" _ Statement* "}" _)? {
     return createArray(std::vector<EvoParser::Value>{ makeString("If"), cond, then_body, else_body });
-};
-
-ElseClause "Else" = "else" _ "{" _ stmts:Statement* "}" _ {
-    return stmts;
 };
 
 WhileStmt "While Statement" = "while" _ cond:Expression "{" _ body:Statement* "}" _ {
     return createArray(std::vector<EvoParser::Value>{ makeString("While"), cond, body });
 };
 
-Assignment "Assignment" = target:Identifier op:AssignOp val:Expression {
+Assignment "Assignment" = target:PrimaryExpr op:AssignOp val:Expression {
     return createArray(std::vector<EvoParser::Value>{ makeString("Assign"), op, target, val });
 };
 
@@ -87,20 +74,11 @@ ViewInstantiation "UI Element" = name:Identifier "(" _ args:CallArgs? ")" _ "{" 
     return createArray(std::vector<EvoParser::Value>{ makeString("ViewNode"), name, args, children });
 };
 
-CallExpr "Call" = target:Identifier "(" _ args:CallArgs? ")" _ {
+CallExpr "Call" = target:PrimaryExpr "(" _ args:CallArgs? ")" _ {
     return createArray(std::vector<EvoParser::Value>{ makeString("Call"), target, args });
 };
 
-CallArgs "Call Arguments" = head:CallArg tail:CallArgRest* {
-    std::vector<EvoParser::Value> out;
-    out.push_back(head);
-    auto tailArr = getArrayElements(tail);
-    for (size_t i = 0; i < tailArr.size; ++i) out.push_back(tailArr[i]);
-    return createArray(out);
-};
-
-CallArgRest = "," _ @CallArg ;
-
+CallArgs "Call Arguments" = @CallArg ("," _ CallArg)* ;
 CallArg "Argument" = (Identifier ":" _)? @Expression ;
 
 BinaryExpr "Binary Operation" = left:PrimaryExpr op:Operator right:Expression {

@@ -1,18 +1,20 @@
-func calculate(start: Int) -> Int {
-    var sum = start
-    var i = 0
+struct Point {
+    var x: Int
+    var y: Int
 
-    while i < 5 {
-        if i == 3 {
-            sum = sum + 100
-        } else {
-            sum = sum + 1
-        }
-        i = i + 1
+    func move(amount: Int) {
+        self.x = self.x + amount
+        self.y = self.y + amount
     }
-    return sum
 }
 
 func main() -> Int {
-    return calculate(start: 10)
+    var p = Point()
+
+    p.x = 10
+    p.y = 5
+
+    p.move(amount: 20)
+
+    return p.x + p.y
 }
