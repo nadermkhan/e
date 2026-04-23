@@ -80,9 +80,22 @@ public:
         }
         auto jit = std::move(jitExpected.get());
 
-        // CRITICAL FIX: Inject the JIT's memory DataLayout into the module.
-        // This ensures the AST function "main" is properly translated to the Windows "_main" ABI.
+        // Inject the JIT's DataLayout so lowering uses the correct target ABI.
         module_->setDataLayout(jit->getDataLayout());
+
+        // Rename the user's `main` to an internal name before handing the module
+        // to the JIT. On Windows/MinGW the x86 backend injects an implicit call to
+        // `__main` (the MinGW CRT static-init helper) at the entry of any function
+        // literally named `main`. That symbol is not available inside the JIT and
+        // causes "Symbols not found: [ __main ]". Renaming avoids the injection
+        // entirely. AOT object emission keeps the original `main` name.
+        constexpr const char* kJitEntryName = "__elegant_jit_entry";
+        if (auto* userMain = module_->getFunction("main")) {
+            userMain->setName(kJitEntryName);
+        } else {
+            llvm::errs() << "Execution Error: Could not find a 'func main()' to execute.\n";
+            return 1;
+        }
 
         auto tsm = llvm::orc::ThreadSafeModule(std::move(module_), std::move(context_));
         if (auto err = jit->addIRModule(std::move(tsm))) {
@@ -90,7 +103,7 @@ public:
             return 1;
         }
 
-        auto mainSym = jit->lookup("main");
+        auto mainSym = jit->lookup(kJitEntryName);
         if (!mainSym) {
             llvm::errs() << "Execution Error: Could not find a 'func main()' to execute.\n";
             return 1;
