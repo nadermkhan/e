@@ -63,7 +63,7 @@ public:
         module_->print(llvm::outs(), nullptr);
     }
 
-    bool emitObjectFile(const std::string& filename) {
+   bool emitObjectFile(const std::string& filename) {
         // 1. Initialize Native Windows Target
         llvm::InitializeAllTargetInfos();
         llvm::InitializeAllTargets();
@@ -71,14 +71,15 @@ public:
         llvm::InitializeAllAsmParsers();
         llvm::InitializeAllAsmPrinters();
 
-        // LLVM 18 Fix: Convert the string to an explicit llvm::Triple object
+        // Fix for LLVM 18 API: Explicitly construct an llvm::Triple object
         std::string targetTripleStr = llvm::sys::getDefaultTargetTriple();
-        llvm::Triple targetTriple(targetTripleStr); 
+        llvm::Triple targetTriple(targetTripleStr);
         
-        module_->setTargetTriple(targetTriple.normalize());
+        module_->setTargetTriple(targetTriple);
 
         std::string error;
-        auto target = llvm::TargetRegistry::lookupTarget(targetTriple.normalize(), error);
+        // Looking up the target can still safely accept the string (ignore the deprecation warning for now)
+        auto target = llvm::TargetRegistry::lookupTarget(targetTripleStr, error);
         if (!target) {
             llvm::errs() << error;
             return false;
@@ -89,8 +90,8 @@ public:
         llvm::TargetOptions opt;
         auto rm = std::optional<llvm::Reloc::Model>(llvm::Reloc::PIC_);
         
-        // Pass the explicit llvm::Triple object to the factory method
-        auto targetMachine = target->createTargetMachine(targetTriple.normalize(), cpu, features, opt, rm);
+        // Fix for LLVM 18 API: Pass the explicit llvm::Triple object here
+        auto targetMachine = target->createTargetMachine(targetTriple, cpu, features, opt, rm);
 
         module_->setDataLayout(targetMachine->createDataLayout());
 
