@@ -23,7 +23,6 @@
 #include <llvm/IR/LegacyPassManager.h>
 
 // === Evo Parser Header ===
-// Using angle brackets ensures we use the generated file in the build folder
 #include <ElegantParser.hpp> 
 
 namespace Elegant {
@@ -62,13 +61,11 @@ public:
     }
 
     bool emitObjectFile(const std::string& filename) {
-        llvm::InitializeAllTargetInfos();
-        llvm::InitializeAllTargets();
-        llvm::InitializeAllTargetMCs();
-        llvm::InitializeAllAsmParsers();
-        llvm::InitializeAllAsmPrinters();
+        // LINKER FIX: Only initialize the native system architecture (x86_64)
+        llvm::InitializeNativeTarget();
+        llvm::InitializeNativeTargetAsmParser();
+        llvm::InitializeNativeTargetAsmPrinter();
 
-        // LLVM 18 Fix: We pass the explicit llvm::Triple object, without calling .normalize()
         std::string targetTripleStr = llvm::sys::getDefaultTargetTriple();
         llvm::Triple targetTriple(targetTripleStr);
         
