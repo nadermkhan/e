@@ -1,4 +1,6 @@
-Program "Program" = _ decls:Declaration* { return decls; };
+Program "Program" = _ decls:Declaration* {
+    return decls;
+};
 
 _ = [ \t\n\r]* ;
 
