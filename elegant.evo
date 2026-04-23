@@ -1,6 +1,4 @@
-Program "Program" = _ decls:Declaration* {
-    return decls;
-};
+Program "Program" = _ decls:Declaration* { return decls; };
 
 _ = [ \t\n\r]* ;
 
@@ -22,11 +20,13 @@ InheritanceClause "Inheritance" = ":" _ @Identifier ("," _ Identifier)* ;
 
 ClassMember "Member" = PropertyDecl / FuncDecl / ViewBodyDecl ;
 
-PropertyDecl "Property" = mutability:Mutability name:Identifier ":" _ type:Type annotation:DefaultValue? {
+PropertyDecl "Property" = mutability:Mutability name:Identifier type:TypeAnnotation? annotation:DefaultValue? {
     return createArray(std::vector<EvoParser::Value>{ makeString("Property"), mutability, name, type, annotation });
 };
 
 Mutability = @$ ("var" / "let") _ ;
+
+TypeAnnotation "Type Annotation" = ":" _ @Type ;
 
 DefaultValue "Default Value" = "=" _ @Expression ;
 
@@ -38,14 +38,38 @@ FuncDecl "Function" = "func" _ name:Identifier "(" _ params:ParamList? ")" _ ret
     return createArray(std::vector<EvoParser::Value>{ makeString("Function"), name, params, returnType, body });
 };
 
-ParamList "Parameters" = @Param ("," _ Param)* ;
-Param "Parameter" = label:Identifier? name:Identifier ":" _ type:Type {
-    return createArray(std::vector<EvoParser::Value>{ label, name, type });
+ParamList "Parameters" = head:Param tail:ParamRest* {
+    std::vector<EvoParser::Value> out;
+    out.push_back(head);
+    auto tailArr = getArrayElements(tail);
+    for (size_t i = 0; i < tailArr.size; ++i) out.push_back(tailArr[i]);
+    return createArray(out);
+};
+
+ParamRest = "," _ @Param ;
+
+Param "Parameter" = first:Identifier second:Identifier? ":" _ type:Type {
+    if (!EvoParser::isNull(second)) {
+        return createArray(std::vector<EvoParser::Value>{ first, second, type });
+    }
+    return createArray(std::vector<EvoParser::Value>{ makeNull(), first, type });
 };
 
 ReturnType "Return Type" = "->" _ @Type ;
 
-Statement "Statement" = PropertyDecl / Assignment / ReturnStmt / Expression ;
+Statement "Statement" = PropertyDecl / Assignment / ReturnStmt / IfStmt / WhileStmt / Expression ;
+
+IfStmt "If Statement" = "if" _ cond:Expression "{" _ then_body:Statement* "}" _ else_body:ElseClause? {
+    return createArray(std::vector<EvoParser::Value>{ makeString("If"), cond, then_body, else_body });
+};
+
+ElseClause "Else" = "else" _ "{" _ stmts:Statement* "}" _ {
+    return stmts;
+};
+
+WhileStmt "While Statement" = "while" _ cond:Expression "{" _ body:Statement* "}" _ {
+    return createArray(std::vector<EvoParser::Value>{ makeString("While"), cond, body });
+};
 
 Assignment "Assignment" = target:Identifier op:AssignOp val:Expression {
     return createArray(std::vector<EvoParser::Value>{ makeString("Assign"), op, target, val });
@@ -67,8 +91,17 @@ CallExpr "Call" = target:Identifier "(" _ args:CallArgs? ")" _ {
     return createArray(std::vector<EvoParser::Value>{ makeString("Call"), target, args });
 };
 
-CallArgs "Call Arguments" = @CallArg ("," _ CallArg)* ;
-CallArg "Argument" = (Identifier ":" _)? Expression ;
+CallArgs "Call Arguments" = head:CallArg tail:CallArgRest* {
+    std::vector<EvoParser::Value> out;
+    out.push_back(head);
+    auto tailArr = getArrayElements(tail);
+    for (size_t i = 0; i < tailArr.size; ++i) out.push_back(tailArr[i]);
+    return createArray(out);
+};
+
+CallArgRest = "," _ @CallArg ;
+
+CallArg "Argument" = (Identifier ":" _)? @Expression ;
 
 BinaryExpr "Binary Operation" = left:PrimaryExpr op:Operator right:Expression {
     return createArray(std::vector<EvoParser::Value>{ makeString("Binary"), op, left, right });
