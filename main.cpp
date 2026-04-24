@@ -126,15 +126,20 @@ public:
     // with an explicit `return`), we temporarily re-point the builder just
     // before the terminator so releases run before control leaves the block.
     void popScope() {
-        llvm::Function* releaseF = module_->getFunction("elegant_release");
-        if (releaseF) {
+        llvm::Function* releaseF      = module_->getFunction("elegant_release");
+        llvm::Function* arrayReleaseF = module_->getFunction("elegant_array_release");
+        if (releaseF || arrayReleaseF) {
             // First check whether this scope contains anything we need to
-            // release; skip all builder manipulation otherwise so we stay a
-            // zero-cost no-op for Int/String/Array-only scopes.
+            // release; skip all builder manipulation otherwise so we stay
+            // a zero-cost no-op for scopes with only primitives.
             bool hasRefs = false;
             for (auto& [name, var] : scopes_.back()) {
                 auto it = structs_.find(var.typeName);
                 if (it != structs_.end() && it->second.isReferenceType) { hasRefs = true; break; }
+                // FEATURE: CoW Arrays — every Array-typed local drops
+                // its ref-count on scope exit so the shared heap buffer
+                // + struct are freed once the last binding dies.
+                if (var.typeName == "Array") { hasRefs = true; break; }
             }
             if (hasRefs) {
                 llvm::BasicBlock* insertBB = builder_->GetInsertBlock();
@@ -156,9 +161,15 @@ public:
                     llvm::Type* ptrTy = llvm::PointerType::getUnqual(*context_);
                     for (auto& [name, var] : scopes_.back()) {
                         auto it = structs_.find(var.typeName);
-                        if (it == structs_.end() || !it->second.isReferenceType) continue;
-                        llvm::Value* objPtr = builder_->CreateLoad(ptrTy, var.alloca);
-                        builder_->CreateCall(releaseF, {objPtr});
+                        if (it != structs_.end() && it->second.isReferenceType) {
+                            llvm::Value* objPtr = builder_->CreateLoad(ptrTy, var.alloca);
+                            if (releaseF) builder_->CreateCall(releaseF, {objPtr});
+                            continue;
+                        }
+                        if (var.typeName == "Array" && arrayReleaseF) {
+                            llvm::Value* arrPtr = builder_->CreateLoad(ptrTy, var.alloca);
+                            builder_->CreateCall(arrayReleaseF, {arrPtr});
+                        }
                     }
 
                     if (term) builder_->SetInsertPoint(savedBB, savedIt);
@@ -444,15 +455,120 @@ public:
         info.type->setBody(info.fieldTypes);
     }
 
+    // FEATURE: Swift-style Arrays are value types backed by a heap
+    // allocation. The layout is { i32 capacity, i32 count, i8* buffer,
+    // i32 ref_count } — the trailing ref_count slot was added so
+    // assignments can implement Copy-on-Write (CoW) value semantics:
+    // multiple live bindings share the same struct + buffer until a
+    // mutation forces a private clone. Slot order is preserved to keep
+    // subscript/append lowerings unchanged (both read slots 0..2 by
+    // positional index).
     llvm::StructType* getSwiftArrayType() {
         if (auto* T = llvm::StructType::getTypeByName(*context_, "SwiftArray")) return T;
         auto* T = llvm::StructType::create(*context_, "SwiftArray");
         T->setBody({
             llvm::Type::getInt32Ty(*context_),
             llvm::Type::getInt32Ty(*context_),
+            llvm::PointerType::getUnqual(*context_),
+            llvm::Type::getInt32Ty(*context_)
+        });
+        return T;
+    }
+
+    // FEATURE: First-Class Closures — a closure value is a "Thick Pointer"
+    // aggregate of { i8* instruction_ptr, i8* context_ptr }. The context
+    // pointer addresses a heap-allocated struct containing every variable
+    // captured from the surrounding lexical scope. This struct type is
+    // reused for every closure so `ClosureType`-tagged values share one
+    // ABI and can flow through variables, parameters, and return values.
+    llvm::StructType* getThickPointerType() {
+        if (auto* T = llvm::StructType::getTypeByName(*context_, "ThickPointer")) return T;
+        auto* T = llvm::StructType::create(*context_, "ThickPointer");
+        T->setBody({
+            llvm::PointerType::getUnqual(*context_),
             llvm::PointerType::getUnqual(*context_)
         });
         return T;
+    }
+
+    // FEATURE: Copy-on-Write (CoW) Arrays — expose libc `memcpy` so the
+    // CoW clone path can duplicate the backing buffer in one call.
+    llvm::Function* getMemcpy() {
+        if (auto* F = module_->getFunction("memcpy")) return F;
+        llvm::Type* ptrTy = llvm::PointerType::getUnqual(*context_);
+        llvm::Type* i64Ty = llvm::Type::getInt64Ty(*context_);
+        return llvm::Function::Create(
+            llvm::FunctionType::get(ptrTy, {ptrTy, ptrTy, i64Ty}, false),
+            llvm::Function::ExternalLinkage, "memcpy", module_.get());
+    }
+
+    // FEATURE: CoW Arrays — emit the ref-count helpers for SwiftArray.
+    // `elegant_array_retain` increments slot 3 (ref_count); the matching
+    // `elegant_array_release` decrements it and, when the count reaches
+    // zero, frees both the backing buffer (slot 2) and the struct itself.
+    void buildArrayARCFunctions() {
+        if (module_->getFunction("elegant_array_retain")) return;
+
+        llvm::Type* voidTy = llvm::Type::getVoidTy(*context_);
+        llvm::Type* ptrTy  = llvm::PointerType::getUnqual(*context_);
+        llvm::Type* i32Ty  = llvm::Type::getInt32Ty(*context_);
+        llvm::StructType* arrTy = getSwiftArrayType();
+
+        {
+            auto* ft = llvm::FunctionType::get(voidTy, {ptrTy}, false);
+            auto* retainF = llvm::Function::Create(ft, llvm::Function::InternalLinkage, "elegant_array_retain", module_.get());
+            auto* bb = llvm::BasicBlock::Create(*context_, "entry", retainF);
+            llvm::IRBuilder<> B(bb);
+
+            llvm::Value* arrObj = retainF->getArg(0);
+            llvm::Value* isNull = B.CreateICmpEQ(arrObj, llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ptrTy)));
+            llvm::BasicBlock* nullBB = llvm::BasicBlock::Create(*context_, "null", retainF);
+            llvm::BasicBlock* bumpBB = llvm::BasicBlock::Create(*context_, "bump", retainF);
+            B.CreateCondBr(isNull, nullBB, bumpBB);
+
+            B.SetInsertPoint(nullBB);
+            B.CreateRetVoid();
+
+            B.SetInsertPoint(bumpBB);
+            llvm::Value* refPtr = B.CreateStructGEP(arrTy, arrObj, 3);
+            llvm::Value* count  = B.CreateLoad(i32Ty, refPtr);
+            llvm::Value* incd   = B.CreateAdd(count, llvm::ConstantInt::get(i32Ty, 1));
+            B.CreateStore(incd, refPtr);
+            B.CreateRetVoid();
+        }
+
+        {
+            auto* ft = llvm::FunctionType::get(voidTy, {ptrTy}, false);
+            auto* releaseF = llvm::Function::Create(ft, llvm::Function::InternalLinkage, "elegant_array_release", module_.get());
+            auto* entryBB = llvm::BasicBlock::Create(*context_, "entry",   releaseF);
+            auto* dropBB  = llvm::BasicBlock::Create(*context_, "drop",    releaseF);
+            auto* freeBB  = llvm::BasicBlock::Create(*context_, "free_it", releaseF);
+            auto* contBB  = llvm::BasicBlock::Create(*context_, "cont",    releaseF);
+            llvm::IRBuilder<> B(entryBB);
+
+            llvm::Value* arrObj = releaseF->getArg(0);
+            llvm::Value* isNull = B.CreateICmpEQ(arrObj, llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ptrTy)));
+            B.CreateCondBr(isNull, contBB, dropBB);
+
+            B.SetInsertPoint(dropBB);
+            llvm::Value* refPtr = B.CreateStructGEP(arrTy, arrObj, 3);
+            llvm::Value* count  = B.CreateLoad(i32Ty, refPtr);
+            llvm::Value* decd   = B.CreateSub(count, llvm::ConstantInt::get(i32Ty, 1));
+            B.CreateStore(decd, refPtr);
+            llvm::Value* isZero = B.CreateICmpSLE(decd, llvm::ConstantInt::get(i32Ty, 0));
+            B.CreateCondBr(isZero, freeBB, contBB);
+
+            B.SetInsertPoint(freeBB);
+            // Free the backing buffer first, then the struct header itself.
+            llvm::Value* bufPtrAddr = B.CreateStructGEP(arrTy, arrObj, 2);
+            llvm::Value* buffer     = B.CreateLoad(ptrTy, bufPtrAddr);
+            B.CreateCall(getFree(), {buffer});
+            B.CreateCall(getFree(), {arrObj});
+            B.CreateBr(contBB);
+
+            B.SetInsertPoint(contBB);
+            B.CreateRetVoid();
+        }
     }
 
     // FEATURE: Dynamic Tagged Unions for Optionals. A type ending in `?`
@@ -460,6 +576,15 @@ public:
     // struct. Implicitly-unwrapped `T!` is treated identically at the storage
     // level; the force-unwrap runtime check is what makes them different.
     llvm::Type* getLLVMType(const std::string& typeName) {
+        // FEATURE: First-Class Closures — a ClosureType value lowers to a
+        // Thick Pointer aggregate carrying both the instruction pointer
+        // and the heap-allocated capture context. We keep raw function
+        // pointers (`(T)->R`) lowered to `i8*` so existing first-class
+        // function references and FFI bindings (e.g. `_beginthread`)
+        // retain their single-pointer ABI.
+        if (typeName == "ClosureType" || typeName == "Closure") {
+            return getThickPointerType();
+        }
         // FEATURE: First-Class Function Pointers. Any type annotation that
         // contains `->` is a function signature (e.g. `(Int)->Void`). At
         // the LLVM level we lower it to a raw opaque pointer — a CPU
@@ -499,6 +624,11 @@ public:
     // imported classes pick up the fully-populated method tables.
     void compile() {
         buildARCFunctions();
+        // FEATURE: CoW Arrays — emit the array-specific retain/release
+        // helpers alongside the class-level ARC runtime so assignments
+        // and scope exits can bump / drop ref counts on heap-backed
+        // SwiftArray value types.
+        buildArrayARCFunctions();
         compileAST(*ctx_, ctx_->root);
 
         // Pass 4: Emit a concrete V-Table global per reference-type class.
@@ -813,6 +943,292 @@ private:
         return TmpB.CreateAlloca(type, nullptr, VarName);
     }
 
+    // FEATURE: First-Class Closures — walk a closure body AST and collect
+    // the names of every outer-scope variable it references. `params` is
+    // the set of identifiers bound by the closure's parameter list; any
+    // identifier in the body that matches a binding in an enclosing scope
+    // AND isn't a parameter gets recorded for capture. Locals declared
+    // inside the closure body (via `var`/`let`) shadow the outer binding
+    // and are also excluded.
+    void collectClosureCaptures(const EvoParser::Value& node,
+                                std::set<std::string>& params,
+                                std::set<std::string>& localDecls,
+                                std::vector<std::string>& captures,
+                                std::set<std::string>& seen) {
+        if (node.type == EvoParser::ValueType::StringView) {
+            std::string name = std::string(EvoParser::toString(node));
+            if (name.empty()) return;
+            if (params.count(name) || localDecls.count(name)) return;
+            if (lookupVar(name) == nullptr) return;
+            if (seen.insert(name).second) captures.push_back(name);
+            return;
+        }
+        if (node.type != EvoParser::ValueType::Array) return;
+
+        auto arr = ctx_->getArrayElements(node);
+        if (arr.size == 0) return;
+
+        // When the head is a tag we recognise, dispatch by shape so we
+        // skip positions that aren't variable references (e.g. the `op`
+        // field on a Binary node, the method name on a MemberAccess, a
+        // string literal payload). Everything we don't explicitly carve
+        // out falls through to a generic recursion over all children.
+        if (arr[0].type == EvoParser::ValueType::StringView) {
+            std::string_view head = EvoParser::toString(arr[0]);
+
+            if (head == "String" || head == "Int" || head == "Float" ||
+                head == "Bool"   || head == "Nil") {
+                return;
+            }
+            if (head == "Property") {
+                // Property declaration inside the closure body:
+                // stmtArr = [ "Property", mutability, name, type, init ]
+                if (arr.size >= 3 && arr[2].type == EvoParser::ValueType::StringView) {
+                    localDecls.insert(std::string(EvoParser::toString(arr[2])));
+                }
+                if (arr.size >= 5) {
+                    collectClosureCaptures(arr[4], params, localDecls, captures, seen);
+                }
+                return;
+            }
+            if (head == "For") {
+                // For loop: [ "For", varName, start, end, body ]
+                if (arr.size >= 5) {
+                    collectClosureCaptures(arr[2], params, localDecls, captures, seen);
+                    collectClosureCaptures(arr[3], params, localDecls, captures, seen);
+                    std::set<std::string> innerDecls = localDecls;
+                    if (arr[1].type == EvoParser::ValueType::StringView) {
+                        innerDecls.insert(std::string(EvoParser::toString(arr[1])));
+                    }
+                    collectClosureCaptures(arr[4], params, innerDecls, captures, seen);
+                }
+                return;
+            }
+            if (head == "MemberAccess") {
+                // [ "MemberAccess", base, prop ] — prop isn't a variable.
+                if (arr.size >= 2) {
+                    collectClosureCaptures(arr[1], params, localDecls, captures, seen);
+                }
+                return;
+            }
+            if (head == "SelfAccess") {
+                return;
+            }
+            if (head == "Binary") {
+                // [ "Binary", op, left, right ] — op is a string, not a var.
+                if (arr.size >= 4) {
+                    collectClosureCaptures(arr[2], params, localDecls, captures, seen);
+                    collectClosureCaptures(arr[3], params, localDecls, captures, seen);
+                }
+                return;
+            }
+            if (head == "Unary") {
+                // [ "Unary", op, expr ] — op is a string.
+                if (arr.size >= 3) {
+                    collectClosureCaptures(arr[2], params, localDecls, captures, seen);
+                }
+                return;
+            }
+            if (head == "Assign") {
+                // [ "Assign", op, target, val ] — op is a string.
+                if (arr.size >= 4) {
+                    collectClosureCaptures(arr[2], params, localDecls, captures, seen);
+                    collectClosureCaptures(arr[3], params, localDecls, captures, seen);
+                }
+                return;
+            }
+            if (head == "Call") {
+                // [ "Call", target, args ] — if target is a bare identifier
+                // naming a top-level function, it's not a variable capture.
+                if (arr.size >= 2) {
+                    if (arr[1].type == EvoParser::ValueType::StringView) {
+                        std::string tgt = std::string(EvoParser::toString(arr[1]));
+                        if (!functions_.count(tgt) && !structs_.count(tgt)) {
+                            collectClosureCaptures(arr[1], params, localDecls, captures, seen);
+                        }
+                    } else {
+                        collectClosureCaptures(arr[1], params, localDecls, captures, seen);
+                    }
+                }
+                if (arr.size >= 3) {
+                    collectClosureCaptures(arr[2], params, localDecls, captures, seen);
+                }
+                return;
+            }
+        }
+
+        for (size_t i = 0; i < arr.size; ++i) {
+            collectClosureCaptures(arr[i], params, localDecls, captures, seen);
+        }
+    }
+
+    // FEATURE: First-Class Closures — lower a `{ x, y in body }` AST to a
+    // Thick Pointer value. The generated LLVM function takes an implicit
+    // leading `i8*` context parameter (the heap-allocated capture struct)
+    // plus the user's declared parameters. Inside the body the captured
+    // variables are unpacked into local allocas so the rest of the
+    // compiler's lowering machinery treats them exactly like ordinary
+    // locals. The returned TypedValue carries the `{fn, ctx}` aggregate
+    // along with a `"Closure"` type tag that downstream call sites use to
+    // pick the thick-pointer calling convention.
+    TypedValue compileClosure(const EvoParser::ArrayView& closureAst) {
+        llvm::BasicBlock* savedBB      = builder_->GetInsertBlock();
+        llvm::BasicBlock::iterator savedIt = builder_->GetInsertPoint();
+
+        // Collect explicit parameter names. The grammar emits either Null
+        // (no params) or an Array<Identifier>.
+        std::vector<std::string> paramNames;
+        if (closureAst.size > 1 && !EvoParser::isNull(closureAst[1])) {
+            auto paramsView = ctx_->getArrayElements(closureAst[1]);
+            for (size_t i = 0; i < paramsView.size; ++i) {
+                paramNames.push_back(std::string(EvoParser::toString(paramsView[i])));
+            }
+        }
+
+        // Walk the body and collect names referenced in the body that
+        // resolve to an enclosing-scope local (and aren't closure params
+        // or inside-the-closure `var` declarations).
+        std::vector<std::string> captureNames;
+        {
+            std::set<std::string> paramSet(paramNames.begin(), paramNames.end());
+            std::set<std::string> localDecls;
+            std::set<std::string> seen;
+            if (closureAst.size > 2 && !EvoParser::isNull(closureAst[2])) {
+                auto bodyView = ctx_->getArrayElements(closureAst[2]);
+                for (size_t i = 0; i < bodyView.size; ++i) {
+                    collectClosureCaptures(bodyView[i], paramSet, localDecls, captureNames, seen);
+                }
+            }
+        }
+
+        // Build the context struct type from the captured variables'
+        // current LLVM types.
+        llvm::Type* ptrTy = llvm::PointerType::getUnqual(*context_);
+        llvm::Type* i64Ty = llvm::Type::getInt64Ty(*context_);
+        std::vector<llvm::Type*> ctxTypes;
+        std::vector<std::string> ctxTypeNames;
+        ctxTypes.reserve(captureNames.size());
+        ctxTypeNames.reserve(captureNames.size());
+        for (const auto& name : captureNames) {
+            VarInfo* var = lookupVar(name);
+            ctxTypeNames.push_back(var->typeName);
+            ctxTypes.push_back(getLLVMType(var->typeName));
+        }
+
+        llvm::StructType* ctxType = llvm::StructType::get(*context_, ctxTypes);
+
+        // Allocate the context struct on the heap so it outlives the
+        // current lexical scope. An empty capture set still gets a
+        // 1-byte malloc so the thick pointer's context slot is always a
+        // valid heap pointer (or null for truly no-capture closures).
+        llvm::Value* ctxHeapPtr;
+        if (captureNames.empty()) {
+            ctxHeapPtr = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ptrTy));
+        } else {
+            uint64_t ctxSize = module_->getDataLayout().getTypeAllocSize(ctxType);
+            ctxHeapPtr = builder_->CreateCall(
+                getMalloc(),
+                {llvm::ConstantInt::get(i64Ty, ctxSize)});
+
+            // Populate the context by loading each captured variable out
+            // of its alloca and storing it into the matching struct slot.
+            for (size_t i = 0; i < captureNames.size(); ++i) {
+                VarInfo* var = lookupVar(captureNames[i]);
+                llvm::Value* loaded = builder_->CreateLoad(ctxTypes[i], var->alloca);
+                llvm::Value* slotPtr = builder_->CreateStructGEP(ctxType, ctxHeapPtr, i);
+                builder_->CreateStore(loaded, slotPtr);
+            }
+        }
+
+        // Build the closure's function type: leading i8* context + one i32
+        // Int per explicit parameter (for the initial release we restrict
+        // closure parameters to `Int` — the same restriction the rest of
+        // the array/loop code applies to user-defined first-class values).
+        std::vector<llvm::Type*> closureArgTypes;
+        closureArgTypes.push_back(ptrTy);
+        for (size_t i = 0; i < paramNames.size(); ++i) {
+            closureArgTypes.push_back(llvm::Type::getInt32Ty(*context_));
+        }
+
+        llvm::FunctionType* ft = llvm::FunctionType::get(
+            llvm::Type::getVoidTy(*context_),
+            closureArgTypes,
+            false);
+
+        static unsigned closureSeq = 0;
+        std::string closureName = "elegant_closure_" + std::to_string(closureSeq++);
+        llvm::Function* closureFunc = llvm::Function::Create(
+            ft,
+            llvm::Function::InternalLinkage,
+            closureName,
+            module_.get());
+
+        // Emit the closure body against a fresh scope. We stash away the
+        // outer scopes on the side so the closure's body can't
+        // accidentally reach into its caller's locals through
+        // `lookupVar` — every capture has to go through the explicit
+        // context struct above.
+        std::vector<std::unordered_map<std::string, VarInfo>> savedScopes;
+        savedScopes.swap(scopes_);
+
+        llvm::BasicBlock* bodyBB = llvm::BasicBlock::Create(*context_, "entry", closureFunc);
+        builder_->SetInsertPoint(bodyBB);
+        pushScope();
+
+        // Unpack captures: for each captured variable create a local
+        // alloca and populate it from the context struct slot. The rest
+        // of compileExpression/compileStatement then treats them as
+        // ordinary locals with the captured value snapshot at closure
+        // creation time (Swift's default `let`-style capture semantics).
+        llvm::Value* contextArg = closureFunc->getArg(0);
+        if (!captureNames.empty()) {
+            for (size_t i = 0; i < captureNames.size(); ++i) {
+                llvm::Value* slotPtr = builder_->CreateStructGEP(ctxType, contextArg, i);
+                llvm::Value* loaded  = builder_->CreateLoad(ctxTypes[i], slotPtr);
+                llvm::AllocaInst* a  = CreateEntryBlockAlloca(closureFunc, captureNames[i], ctxTypes[i]);
+                builder_->CreateStore(loaded, a);
+                defineVar(captureNames[i], {a, ctxTypeNames[i]});
+            }
+        }
+
+        // Parameter allocas. Each declared closure parameter lands in a
+        // fresh `Int` alloca so the body can read/write it like any
+        // other local.
+        for (size_t i = 0; i < paramNames.size(); ++i) {
+            llvm::Value* argVal = closureFunc->getArg(1 + i);
+            llvm::AllocaInst* a  = CreateEntryBlockAlloca(closureFunc, paramNames[i], llvm::Type::getInt32Ty(*context_));
+            builder_->CreateStore(argVal, a);
+            defineVar(paramNames[i], {a, "Int"});
+        }
+
+        if (closureAst.size > 2 && !EvoParser::isNull(closureAst[2])) {
+            auto bodyView = ctx_->getArrayElements(closureAst[2]);
+            for (size_t i = 0; i < bodyView.size; ++i) {
+                compileStatement(bodyView[i]);
+            }
+        }
+
+        // Append an implicit `ret void` if the body didn't provide one.
+        {
+            llvm::BasicBlock* tailBB = builder_->GetInsertBlock();
+            bool tailHasTerm = tailBB && !tailBB->empty() && tailBB->back().isTerminator();
+            if (tailBB && !tailHasTerm) builder_->CreateRetVoid();
+        }
+
+        popScope();
+        savedScopes.swap(scopes_);
+
+        builder_->SetInsertPoint(savedBB, savedIt);
+
+        // Assemble the Thick Pointer aggregate `{fn, ctx}` and hand it
+        // back tagged with the special `Closure` type.
+        llvm::StructType* thickTy = getThickPointerType();
+        llvm::Value* thickPtr = llvm::UndefValue::get(thickTy);
+        thickPtr = builder_->CreateInsertValue(thickPtr, closureFunc, 0);
+        thickPtr = builder_->CreateInsertValue(thickPtr, ctxHeapPtr, 1);
+        return {thickPtr, "Closure"};
+    }
+
     llvm::Function* compileFunction(const EvoParser::ArrayView& funcNode, std::string className, llvm::StructType* classType) {
         std::string name = std::string(EvoParser::toString(funcNode[1]));
         if (!className.empty()) name = className + "_" + name;
@@ -1101,6 +1517,17 @@ private:
                     builder_->CreateStore(initVal.val, Alloca);
                 }
             } else if (initVal.val) {
+                // FEATURE: CoW Arrays — when a new binding aliases an
+                // existing Array value (e.g. `var b = a`), retain the
+                // shared struct so the backing buffer + header outlive
+                // whichever binding dies first. A fresh array literal
+                // already seeds ref_count = 1, so the retain here rides
+                // it up to 2 while both locals are live.
+                if (varType == "Array") {
+                    if (auto* arRetain = module_->getFunction("elegant_array_retain")) {
+                        builder_->CreateCall(arRetain, {initVal.val});
+                    }
+                }
                 builder_->CreateStore(initVal.val, Alloca);
             }
             return;
@@ -1147,6 +1574,20 @@ private:
                 llvm::Value* oldObj = builder_->CreateLoad(ptrTy, lhs.val);
                 builder_->CreateCall(module_->getFunction("elegant_release"), {oldObj});
                 builder_->CreateCall(module_->getFunction("elegant_retain"),  {rhs.val});
+            }
+            // FEATURE: CoW Arrays — the same retain/release dance for
+            // Array rebinds. The outgoing binding drops its share of the
+            // shared struct, the incoming binding bumps the ref_count so
+            // the two never race on the underlying heap buffer.
+            if (lhs.type == "Array" && rhs.type == "Array") {
+                llvm::Type* ptrTy = llvm::PointerType::getUnqual(*context_);
+                llvm::Value* oldArr = builder_->CreateLoad(ptrTy, lhs.val);
+                if (auto* arRel = module_->getFunction("elegant_array_release")) {
+                    builder_->CreateCall(arRel, {oldArr});
+                }
+                if (auto* arRet = module_->getFunction("elegant_array_retain")) {
+                    builder_->CreateCall(arRet, {rhs.val});
+                }
             }
 
             builder_->CreateStore(rhs.val, lhs.val);
@@ -1301,6 +1742,13 @@ private:
             return {innerVal, innerType};
         }
 
+        // FEATURE: First-Class Closures — `{ x in body }` expressions lower
+        // to a thick-pointer aggregate captured from the surrounding
+        // scope. See `compileClosure` for the full lowering.
+        if (nodeType == "Closure") {
+            return compileClosure(exprArr);
+        }
+
         if (nodeType == "ArrayLiteral") {
             std::vector<llvm::Value*> elements;
             if (!EvoParser::isNull(exprArr[1])) {
@@ -1317,11 +1765,23 @@ private:
             llvm::Value* arrHeapPtr = builder_->CreateCall(getMalloc(), {llvm::ConstantInt::get(llvm::Type::getInt64Ty(*context_), structSize)});
 
             uint64_t bufSize = elements.size() * 4;
-            llvm::Value* bufHeapPtr = builder_->CreateCall(getMalloc(), {llvm::ConstantInt::get(llvm::Type::getInt64Ty(*context_), bufSize)});
+            // Guarantee at least a 4-byte scratch allocation so empty
+            // literals can still round-trip through `free` without
+            // tripping platform-specific "free(nullptr) isn't always
+            // nullptr" quirks (MSVCRT in particular).
+            uint64_t allocBufSize = bufSize == 0 ? 4 : bufSize;
+            llvm::Value* bufHeapPtr = builder_->CreateCall(getMalloc(), {llvm::ConstantInt::get(llvm::Type::getInt64Ty(*context_), allocBufSize)});
 
             builder_->CreateStore(llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context_), elements.size()), builder_->CreateStructGEP(arrTy, arrHeapPtr, 0));
             builder_->CreateStore(llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context_), elements.size()), builder_->CreateStructGEP(arrTy, arrHeapPtr, 1));
             builder_->CreateStore(bufHeapPtr, builder_->CreateStructGEP(arrTy, arrHeapPtr, 2));
+            // FEATURE: CoW Arrays — a freshly-minted array literal is the
+            // sole owner of its struct + buffer, so seed ref_count = 1.
+            // Assignments and parameter passing bump this via
+            // `elegant_array_retain`, and scope exit releases it.
+            builder_->CreateStore(
+                llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context_), 1),
+                builder_->CreateStructGEP(arrTy, arrHeapPtr, 3));
 
             for (size_t i = 0; i < elements.size(); i++) {
                 llvm::Value* idxVal = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context_), i);
@@ -1377,8 +1837,40 @@ private:
                 std::string targetName = std::string(EvoParser::toString(targetNode));
                 if (!functions_.count(targetName) && !structs_.count(targetName)) {
                     TypedValue funcVar = compileExpression(targetNode);
-                    if (funcVar.type.find("->") == std::string::npos) {
+                    bool isClosure = (funcVar.type == "Closure" || funcVar.type == "ClosureType");
+                    if (!isClosure && funcVar.type.find("->") == std::string::npos) {
                         ThrowTypeError("Attempted to call '" + targetName + "' which is not a function.");
+                    }
+
+                    // FEATURE: First-Class Closures — thick-pointer call
+                    // convention. Extract the instruction pointer + the
+                    // heap context pointer from the aggregate and invoke
+                    // the closure with the context slot prepended as an
+                    // implicit first argument. Return type is always
+                    // Void at the moment (the closure grammar doesn't
+                    // carry an explicit return type yet).
+                    if (isClosure) {
+                        llvm::Type* ptrTy = llvm::PointerType::getUnqual(*context_);
+                        llvm::Value* instructionPtr = builder_->CreateExtractValue(funcVar.val, 0, "closure_fn");
+                        llvm::Value* contextPtr     = builder_->CreateExtractValue(funcVar.val, 1, "closure_ctx");
+
+                        std::vector<llvm::Value*> argsV;
+                        std::vector<llvm::Type*>  argLLTypes;
+                        argsV.push_back(contextPtr);
+                        argLLTypes.push_back(ptrTy);
+
+                        if (!EvoParser::isNull(exprArr[2])) {
+                            auto argsArr = ctx_->getArrayElements(exprArr[2]);
+                            for (size_t i = 0; i < argsArr.size; ++i) {
+                                TypedValue argVal = compileExpression(argsArr[i]);
+                                argsV.push_back(argVal.val);
+                                argLLTypes.push_back(getLLVMType(argVal.type));
+                            }
+                        }
+
+                        llvm::FunctionType* ft = llvm::FunctionType::get(llvm::Type::getVoidTy(*context_), argLLTypes, false);
+                        builder_->CreateCall(ft, instructionPtr, argsV);
+                        return {nullptr, "Void"};
                     }
 
                     // Parse return type out of `(T1,T2,...)->TR`. Canonical
@@ -1475,17 +1967,31 @@ private:
                     auto var = lookupVar(baseName);
                     if (!var) ThrowTypeError("Unknown variable '" + baseName + "'");
 
-                    // FEATURE: Dynamic Array Resizing via `Array.append`.
-                    // Arrays live on the heap as `{ i32 capacity, i32 count,
-                    // i8* buffer }`. When the user calls `.append(x)` we
-                    // compare the current count against the capacity. If
-                    // they match, we double the capacity and `realloc` the
-                    // backing buffer in place. The post-realloc buffer
-                    // pointer is re-loaded from the struct because realloc
-                    // is allowed to return a fresh address. Finally we
-                    // store the new element at `buffer[count]` and bump the
-                    // count. All branches rejoin at a single append block
-                    // so the rest of the function sees a well-formed CFG.
+                    // FEATURE: Dynamic Array Resizing + Copy-on-Write via
+                    // `Array.append`. Arrays live on the heap as
+                    // `{ i32 capacity, i32 count, i8* buffer, i32 ref_count }`.
+                    //
+                    // Swift arrays are value types with shared backing
+                    // storage: two live bindings share the heap buffer
+                    // until one of them mutates, at which point the
+                    // mutator gets a private clone. Append is the canonical
+                    // mutation entry point, so we insert an
+                    // `isKnownUniquelyReferenced` fast-path check here:
+                    //   * ref_count == 1  → mutate in place (the common
+                    //     case; zero overhead beyond one load/compare).
+                    //   * ref_count  > 1  → fork off a `cow_clone` block
+                    //     that allocates a fresh struct + buffer, memcpys
+                    //     the data across, drops the original ref (so the
+                    //     other sharers still see the old data), and
+                    //     stores the new struct into this variable's
+                    //     alloca so subsequent loads see the private copy.
+                    //
+                    // All branches rejoin at a single `mutate_array` block
+                    // which does the familiar capacity check + realloc,
+                    // then stores the new element at `buffer[count]` and
+                    // bumps the count. All branches rejoin at a single
+                    // append block so the rest of the function sees a
+                    // well-formed CFG.
                     if (var->typeName == "Array" && methodName == "append") {
                         if (EvoParser::isNull(exprArr[2])) ThrowTypeError("Array.append requires exactly one argument.");
                         auto argsArr = ctx_->getArrayElements(exprArr[2]);
@@ -1498,6 +2004,74 @@ private:
                         llvm::Type* i64Ty = llvm::Type::getInt64Ty(*context_);
                         llvm::StructType* arrTy = getSwiftArrayType();
 
+                        // --- Copy-on-Write fast-path check ---
+                        // Load the current struct pointer + its ref_count.
+                        // If the count is > 1 we fall into CoWCloneBB and
+                        // replace this variable's alloca with a private
+                        // copy; otherwise we go straight to MutateBB and
+                        // rewrite the shared struct in place.
+                        llvm::Function* TheFunction = builder_->GetInsertBlock()->getParent();
+                        llvm::Value* sharedArr    = builder_->CreateLoad(ptrTy, var->alloca);
+                        llvm::Value* sharedRefPtr = builder_->CreateStructGEP(arrTy, sharedArr, 3);
+                        llvm::Value* sharedRef    = builder_->CreateLoad(i32Ty, sharedRefPtr);
+                        llvm::Value* isUnique     = builder_->CreateICmpEQ(sharedRef, llvm::ConstantInt::get(i32Ty, 1));
+
+                        llvm::BasicBlock* CoWCloneBB = llvm::BasicBlock::Create(*context_, "cow_clone",   TheFunction);
+                        llvm::BasicBlock* MutateBB   = llvm::BasicBlock::Create(*context_, "mutate_array", TheFunction);
+                        builder_->CreateCondBr(isUnique, MutateBB, CoWCloneBB);
+
+                        // --- Copy-on-Write clone path ---
+                        builder_->SetInsertPoint(CoWCloneBB);
+                        llvm::Value* oldCapPtr    = builder_->CreateStructGEP(arrTy, sharedArr, 0);
+                        llvm::Value* oldCountPtr  = builder_->CreateStructGEP(arrTy, sharedArr, 1);
+                        llvm::Value* oldBufPtr    = builder_->CreateStructGEP(arrTy, sharedArr, 2);
+                        llvm::Value* oldCap   = builder_->CreateLoad(i32Ty, oldCapPtr);
+                        llvm::Value* oldCount = builder_->CreateLoad(i32Ty, oldCountPtr);
+                        llvm::Value* oldBuf   = builder_->CreateLoad(ptrTy, oldBufPtr);
+
+                        // Allocate the new buffer. `max(capacity, 1)` keeps
+                        // us from sitting on a zero-byte malloc that some
+                        // libcs refuse to service.
+                        llvm::Value* capIsZero   = builder_->CreateICmpEQ(oldCap, llvm::ConstantInt::get(i32Ty, 0));
+                        llvm::Value* allocCap    = builder_->CreateSelect(capIsZero, llvm::ConstantInt::get(i32Ty, 1), oldCap);
+                        llvm::Value* bytesToCopy = builder_->CreateMul(oldCount, llvm::ConstantInt::get(i32Ty, 4));
+                        llvm::Value* bytesToAlloc= builder_->CreateMul(allocCap, llvm::ConstantInt::get(i32Ty, 4));
+                        llvm::Value* newBuf      = builder_->CreateCall(
+                            getMalloc(),
+                            {builder_->CreateZExt(bytesToAlloc, i64Ty)});
+                        builder_->CreateCall(getMemcpy(), {
+                            newBuf,
+                            oldBuf,
+                            builder_->CreateZExt(bytesToCopy, i64Ty)
+                        });
+
+                        // Allocate the new SwiftArray struct, seed it with
+                        // the same capacity/count and a freshly-owned
+                        // ref_count of 1.
+                        uint64_t structSize = module_->getDataLayout().getTypeAllocSize(arrTy);
+                        llvm::Value* newArr = builder_->CreateCall(
+                            getMalloc(),
+                            {llvm::ConstantInt::get(i64Ty, structSize)});
+                        builder_->CreateStore(oldCap,   builder_->CreateStructGEP(arrTy, newArr, 0));
+                        builder_->CreateStore(oldCount, builder_->CreateStructGEP(arrTy, newArr, 1));
+                        builder_->CreateStore(newBuf,   builder_->CreateStructGEP(arrTy, newArr, 2));
+                        builder_->CreateStore(
+                            llvm::ConstantInt::get(i32Ty, 1),
+                            builder_->CreateStructGEP(arrTy, newArr, 3));
+
+                        // Drop this variable's share of the original
+                        // struct and rebind the local to the private copy.
+                        if (auto* arRel = module_->getFunction("elegant_array_release")) {
+                            builder_->CreateCall(arRel, {sharedArr});
+                        }
+                        builder_->CreateStore(newArr, var->alloca);
+                        builder_->CreateBr(MutateBB);
+
+                        builder_->SetInsertPoint(MutateBB);
+
+                        // Re-load via the alloca so we see the clone on
+                        // the CoW path and the original struct on the
+                        // unique-ref path.
                         llvm::Value* arrObj = builder_->CreateLoad(ptrTy, var->alloca);
                         llvm::Value* capPtr     = builder_->CreateStructGEP(arrTy, arrObj, 0);
                         llvm::Value* countPtr   = builder_->CreateStructGEP(arrTy, arrObj, 1);
@@ -1509,7 +2083,6 @@ private:
 
                         llvm::Value* isFull = builder_->CreateICmpEQ(count, capacity);
 
-                        llvm::Function* TheFunction = builder_->GetInsertBlock()->getParent();
                         llvm::BasicBlock* ReallocBB = llvm::BasicBlock::Create(*context_, "realloc_buf", TheFunction);
                         llvm::BasicBlock* AppendBB  = llvm::BasicBlock::Create(*context_, "append_item", TheFunction);
 

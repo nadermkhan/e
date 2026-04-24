@@ -1,0 +1,62 @@
+// Integration test for First-Class Closures (Thick Pointers with Environment
+// Capture) and Copy-on-Write (CoW) value-type Arrays. Both features are
+// exercised end-to-end:
+//
+//   1. Closures capture outer locals by value and are invoked through a
+//      first-class `Closure` variable — the printed lines prove that
+//      multi-capture + multi-param closures survive past the enclosing
+//      scope and can be called repeatedly.
+//   2. Two array bindings alias the same heap buffer until one of them
+//      appends; after the mutation the other binding still sees the
+//      original contents, because CoW forked off a private clone. A
+//      subsequent append on the same unique-ref binding does *not*
+//      clone again.
+
+extern func printf(format: String, ...) -> Void
+
+func main() -> Int {
+    // --- Module 1: Thick-Pointer Closures ---
+
+    // Single-capture, single-param closure.
+    var base = 100
+    var bump = { x in
+        printf(format: "bump: base=%d arg=%d sum=%d\n", base, x, base + x)
+    }
+    bump(7)
+    bump(42)
+
+    // Multi-capture, multi-param closure — both `label` and `factor`
+    // are pulled into the context struct.
+    var label = "scale"
+    var factor = 3
+    var scale = { a, b in
+        printf(format: "%s: a=%d b=%d result=%d\n", label, a, b, (a + b) * factor)
+    }
+    scale(2, 5)
+    scale(10, 20)
+
+    // Zero-capture, zero-param closure. The context pointer is null but
+    // the call still flows through the thick-pointer convention.
+    var hello = { in
+        printf(format: "hello from a zero-capture closure\n")
+    }
+    hello()
+
+    // --- Module 2: Copy-on-Write Arrays ---
+
+    var a = [10, 20, 30]
+    var b = a          // shares the heap buffer + struct with `a`
+    b.append(99)        // triggers CoW: `b` forks a private copy
+    b.append(123)       // `b` is now uniquely referenced — no clone
+
+    printf(format: "a[0]=%d a[1]=%d a[2]=%d\n", a[0], a[1], a[2])
+    printf(format: "b[0]=%d b[1]=%d b[2]=%d b[3]=%d b[4]=%d\n",
+           b[0], b[1], b[2], b[3], b[4])
+
+    // Appending to `a` after the fork is also a unique-ref fast path
+    // now that `b` has moved to its own buffer, so `a` mutates in place.
+    a.append(40)
+    printf(format: "a[0]=%d a[1]=%d a[2]=%d a[3]=%d\n", a[0], a[1], a[2], a[3])
+
+    return 0
+}
