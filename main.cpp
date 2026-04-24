@@ -8,6 +8,7 @@
 #include <memory>
 #include <system_error>
 #include <cstdlib>
+#include <set>
 
 // === LLVM Headers ===
 #include <llvm/IR/LLVMContext.h>
@@ -66,10 +67,17 @@ struct FuncSig {
     std::string retType;
     std::vector<std::string> argTypes;
     bool isVarArg = false;
+    // FEATURE: Static Dispatch — static methods don't receive an implicit
+    // `self` and are not installed into the V-Table.
+    bool isStatic = false;
 };
 
 class LLVMCompiler {
-    EvoParser::ParseContext& ctx_;
+    // FEATURE: Module Linker — `ctx_` is a mutable pointer so `compileAST`
+    // can swap the active parse context when recursing into an imported
+    // file. Every AST node carries indices into its own arena, so the
+    // visitor must use the context the AST was parsed against.
+    EvoParser::ParseContext* ctx_;
     std::unique_ptr<llvm::LLVMContext> context_;
     std::unique_ptr<llvm::Module> module_;
     std::unique_ptr<llvm::IRBuilder<>> builder_;
@@ -79,9 +87,26 @@ class LLVMCompiler {
     std::unordered_map<std::string, StructInfo> structs_;
     std::unordered_map<std::string, FuncSig> functions_;
 
+    // FEATURE: Module Linker — track already-imported files + keep the
+    // imported sources and parse contexts alive for the lifetime of the
+    // compiler so string-view AST nodes don't dangle.
+    std::set<std::string> imported_modules_;
+    std::vector<std::unique_ptr<std::string>> module_sources_;
+    std::vector<std::unique_ptr<EvoParser::ParseContext>> module_contexts_;
+
+    // FEATURE: Type Alias Registry — `import MathLib as ML` maps the
+    // user-visible name `ML` to the real struct name `MathLib` so
+    // type lookups and static method calls route transparently.
+    std::unordered_map<std::string, std::string> type_aliases_;
+
+    std::string resolveAlias(const std::string& name) {
+        auto it = type_aliases_.find(name);
+        return it == type_aliases_.end() ? name : it->second;
+    }
+
 public:
     LLVMCompiler(EvoParser::ParseContext& ctx, const std::string& moduleName)
-        : ctx_(ctx) {
+        : ctx_(&ctx) {
         context_ = std::make_unique<llvm::LLVMContext>();
         module_ = std::make_unique<llvm::Module>(moduleName, *context_);
         builder_ = std::make_unique<llvm::IRBuilder<>>(*context_);
@@ -151,6 +176,13 @@ public:
         return nullptr;
     }
     void defineVar(const std::string& name, VarInfo info) {
+        // FEATURE: Strict Symbol Hygiene — reject redeclaration within the
+        // same local scope. Parameters count, since `compileFunction`
+        // registers them into the function's top scope before the body
+        // runs. Shadowing across nested scopes is still allowed.
+        if (!scopes_.empty() && scopes_.back().count(name)) {
+            ThrowTypeError("Invalid redeclaration of variable '" + name + "' in the same scope.");
+        }
         scopes_.back()[name] = info;
     }
     // -------------------------
@@ -235,6 +267,11 @@ public:
     // is the ref_count. retain/release GEP into slot 1 to bump/drop the
     // reference counter; release frees the whole allocation when it hits 0.
     void buildARCFunctions() {
+        // Idempotent — the Module Linker's `compileAST` may run multiple
+        // times across imported files, and we only want one copy of the
+        // retain/release runtime in the LLVM module.
+        if (module_->getFunction("elegant_retain")) return;
+
         llvm::Type* voidTy = llvm::Type::getVoidTy(*context_);
         llvm::Type* ptrTy  = llvm::PointerType::getUnqual(*context_);
         llvm::Type* i32Ty  = llvm::Type::getInt32Ty(*context_);
@@ -355,9 +392,9 @@ public:
             fieldIdx = static_cast<unsigned>(info.fieldTypes.size());
         }
 
-        auto members = ctx_.getArrayElements(info.astMembers);
+        auto members = ctx_->getArrayElements(info.astMembers);
         for (const auto& mem : members) {
-            auto memArr = ctx_.getArrayElements(mem);
+            auto memArr = ctx_->getArrayElements(mem);
             if (memArr.size == 0) continue;
             std::string_view kind = EvoParser::toString(memArr[0]);
 
@@ -368,10 +405,14 @@ public:
                 info.fieldTypes.push_back(getLLVMType(propType));
                 info.fieldTypesString[propName] = propType;
             }
-            else if (kind == "Function") {
+            else if (kind == "Function" || kind == "StaticFunction") {
+                // FEATURE: Static Dispatch — static methods never occupy a
+                // V-Table slot (there is no instance to dispatch through).
+                bool isStaticMethod = (kind == "StaticFunction");
+
                 // Only reference types carry a V-Table; value-type structs
                 // keep static dispatch.
-                if (!info.isReferenceType) continue;
+                if (isStaticMethod || !info.isReferenceType) continue;
 
                 std::string funcName = std::string(EvoParser::toString(memArr[1]));
                 std::string mangled  = name + "_" + funcName;
@@ -444,155 +485,21 @@ public:
         if (typeName == "Array") return llvm::PointerType::getUnqual(*context_);
         if (typeName == "Void" || typeName == "") return llvm::Type::getVoidTy(*context_);
 
-        if (structs_.count(typeName)) {
-            if (structs_[typeName].isReferenceType) return llvm::PointerType::getUnqual(*context_);
-            else return structs_[typeName].type;
+        std::string resolvedType = resolveAlias(typeName);
+        if (structs_.count(resolvedType)) {
+            if (structs_[resolvedType].isReferenceType) return llvm::PointerType::getUnqual(*context_);
+            else return structs_[resolvedType].type;
         }
         return llvm::Type::getInt32Ty(*context_);
     }
 
+    // FEATURE: Module Linker — public entry point. Emits the ARC runtime
+    // once, recursively compiles the root file (and anything it imports),
+    // then finalises every V-Table global in a single pass at the end so
+    // imported classes pick up the fully-populated method tables.
     void compile() {
-        // FEATURE: ARC — emit the retain/release runtime into every module
-        // before any user code can reference it.
         buildARCFunctions();
-
-        auto declarations = ctx_.getArrayElements(ctx_.root);
-
-        // Pass 1: Type & Signature Registration
-        for (const auto& declVal : declarations) {
-            auto declArr = ctx_.getArrayElements(declVal);
-            if (declArr.size == 0) continue;
-            std::string_view nodeType = EvoParser::toString(declArr[0]);
-
-            if (nodeType == "Class" || nodeType == "Struct") {
-                std::string name = std::string(EvoParser::toString(declArr[1]));
-                StructInfo& info = structs_[name];
-                info.type = llvm::StructType::create(*context_, name);
-                info.isReferenceType = (nodeType == "Class");
-                info.astMembers = declArr[3];
-
-                // FEATURE: Polymorphism — capture the inheritance clause.
-                // The parser emits superclass as an array of Identifiers so we
-                // accept both the array form and the plain StringView form for
-                // forward-compat. Only classes participate in inheritance.
-                if (nodeType == "Class" && !EvoParser::isNull(declArr[2])) {
-                    auto supVal = declArr[2];
-                    if (supVal.type == EvoParser::ValueType::StringView) {
-                        info.superclass = std::string(EvoParser::toString(supVal));
-                    } else if (supVal.type == EvoParser::ValueType::Array) {
-                        auto supArr = ctx_.getArrayElements(supVal);
-                        if (supArr.size > 0) {
-                            info.superclass = std::string(EvoParser::toString(supArr[0]));
-                        }
-                    }
-                }
-
-                // Register method signatures so Pass 3 can typecheck calls.
-                for (const auto& mem : ctx_.getArrayElements(info.astMembers)) {
-                    auto memArr = ctx_.getArrayElements(mem);
-                    if (memArr.size == 0) continue;
-                    if (EvoParser::toString(memArr[0]) != "Function") continue;
-
-                    std::string mName = name + "_" + std::string(EvoParser::toString(memArr[1]));
-                    FuncSig sig;
-                    sig.argTypes.push_back(name); // Implicit 'self'
-                    if (!EvoParser::isNull(memArr[2])) {
-                        for (const auto& param : ctx_.getArrayElements(memArr[2])) {
-                            sig.argTypes.push_back(std::string(EvoParser::toString(ctx_.getArrayElements(param)[2])));
-                        }
-                    }
-                    sig.retType = EvoParser::isNull(memArr[3]) ? "Void" : std::string(EvoParser::toString(memArr[3]));
-                    functions_[mName] = sig;
-                }
-            }
-            else if (nodeType == "Extern") {
-                std::string extName = std::string(EvoParser::toString(declArr[1]));
-
-                // The Prelude declares a handful of externs (printf, exit,
-                // sqrt, ...) that user scripts are still free to declare
-                // themselves. Swallow duplicate registrations so `extern
-                // func printf` in user code doesn't collide with the
-                // prelude-injected declaration (or with a previously
-                // emitted intrinsic like `getPrintf`'s shim).
-                if (functions_.count(extName)) continue;
-
-                FuncSig sig;
-                std::vector<llvm::Type*> argTypes;
-
-                if (!EvoParser::isNull(declArr[2])) {
-                    auto paramsArr = ctx_.getArrayElements(declArr[2]);
-                    for (const auto& param : paramsArr) {
-                        auto p = ctx_.getArrayElements(param);
-                        std::string pType = std::string(EvoParser::toString(p[2]));
-                        if (pType == "VarArg") sig.isVarArg = true;
-                        else {
-                            sig.argTypes.push_back(pType);
-                            argTypes.push_back(getLLVMType(pType));
-                        }
-                    }
-                }
-                sig.retType = EvoParser::isNull(declArr[3]) ? "Void" : std::string(EvoParser::toString(declArr[3]));
-                functions_[extName] = sig;
-
-                if (!module_->getFunction(extName)) {
-                    llvm::FunctionType* ft = llvm::FunctionType::get(getLLVMType(sig.retType), argTypes, sig.isVarArg);
-                    llvm::Function::Create(ft, llvm::Function::ExternalLinkage, extName, module_.get());
-                }
-            }
-        }
-
-        // Pass 2a: Register top-level function signatures (Pass 1 handled
-        // methods, structs, classes and externs already).
-        for (const auto& declVal : declarations) {
-            auto declArr = ctx_.getArrayElements(declVal);
-            if (declArr.size == 0) continue;
-            std::string_view nodeType = EvoParser::toString(declArr[0]);
-
-            if (nodeType == "Function") {
-                std::string name = std::string(EvoParser::toString(declArr[1]));
-                FuncSig sig;
-                if (!EvoParser::isNull(declArr[2])) {
-                    for (const auto& param : ctx_.getArrayElements(declArr[2])) {
-                        sig.argTypes.push_back(std::string(EvoParser::toString(ctx_.getArrayElements(param)[2])));
-                    }
-                }
-                sig.retType = EvoParser::isNull(declArr[3]) ? "Void" : std::string(EvoParser::toString(declArr[3]));
-                functions_[name] = sig;
-            }
-        }
-
-        // Pass 2b: Resolve class/struct memory layouts recursively so parent
-        // classes are laid out before their children.
-        for (const auto& declVal : declarations) {
-            auto declArr = ctx_.getArrayElements(declVal);
-            if (declArr.size == 0) continue;
-            std::string_view nodeType = EvoParser::toString(declArr[0]);
-            if (nodeType == "Class" || nodeType == "Struct") {
-                resolveLayout(std::string(EvoParser::toString(declArr[1])));
-            }
-        }
-
-        // Pass 3: Code Generation
-        pushScope(); // Global scope
-        for (const auto& declVal : declarations) {
-            auto declArr = ctx_.getArrayElements(declVal);
-            if (declArr.size == 0) continue;
-            std::string_view nodeType = EvoParser::toString(declArr[0]);
-
-            if (nodeType == "Function") {
-                compileFunction(declArr, "", nullptr);
-            } else if (nodeType == "Class" || nodeType == "Struct") {
-                std::string className = std::string(EvoParser::toString(declArr[1]));
-                auto members = ctx_.getArrayElements(declArr[3]);
-                for (const auto& mem : members) {
-                    auto memArr = ctx_.getArrayElements(mem);
-                    if (EvoParser::toString(memArr[0]) == "Function") {
-                        compileFunction(memArr, className, structs_[className].type);
-                    }
-                }
-            }
-        }
-        popScope();
+        compileAST(*ctx_, ctx_->root);
 
         // Pass 4: Emit a concrete V-Table global per reference-type class.
         // Each slot is initialised with a pointer to the final (possibly
@@ -615,6 +522,227 @@ public:
             }
             info.vtableGlobal->setInitializer(llvm::ConstantStruct::get(info.vtableType, funcs));
         }
+    }
+
+    void compileAST(EvoParser::ParseContext& currentCtx, const EvoParser::Value& astRoot) {
+        // FEATURE: Module Linker — swap the active parse context for the
+        // duration of this call. Recursive `compileAST` invocations for
+        // imported files each set `ctx_` to their own context on entry
+        // and restore it on exit, so AST traversals in nested passes
+        // always see the arena the AST was actually parsed against.
+        EvoParser::ParseContext* savedCtx = ctx_;
+        ctx_ = &currentCtx;
+
+        auto declarations = ctx_->getArrayElements(astRoot);
+
+        // Pass 1: Type & Signature Registration (plus Module Imports).
+        for (const auto& declVal : declarations) {
+            auto declArr = ctx_->getArrayElements(declVal);
+            if (declArr.size == 0) continue;
+            std::string_view nodeType = EvoParser::toString(declArr[0]);
+
+            // FEATURE: Module Linker — the `import Foo` statement loads
+            // `Foo.ele` from disk, parses it, and recursively runs the full
+            // compile pipeline on the sub-AST. Classes, static functions,
+            // and globals from the imported file are merged into the
+            // active `structs_` / `functions_` tables before this file's
+            // own Pass 2/3 runs, so forward references Just Work.
+            if (nodeType == "Import") {
+                std::string pkgName = std::string(EvoParser::toString(declArr[1]));
+
+                // FEATURE: `as` alias keyword — `import MathLib as ML`
+                // routes lookups of `ML` to the real struct name `MathLib`.
+                if (declArr.size > 2 && !EvoParser::isNull(declArr[2])) {
+                    auto aliasArr = ctx_->getArrayElements(declArr[2]);
+                    if (aliasArr.size > 0) {
+                        // The sub-group captures `("as" _ Identifier)`;
+                        // we only care about the Identifier in slot 2.
+                        std::string alias = std::string(EvoParser::toString(aliasArr[aliasArr.size - 1]));
+                        if (type_aliases_.count(alias) || structs_.count(alias)) {
+                            ThrowTypeError("Alias collision: The name '" + alias + "' is already in use.");
+                        }
+                        type_aliases_[alias] = pkgName; // Map ML -> MathLib
+                    }
+                }
+
+                // Prevent infinite import cycles.
+                if (imported_modules_.count(pkgName)) continue;
+                imported_modules_.insert(pkgName);
+
+                std::string filename = pkgName + ".ele";
+                std::ifstream ifs(filename);
+                if (!ifs) ThrowTypeError("Module Linker Error: Cannot find file '" + filename + "'");
+
+                auto sourceStr = std::make_unique<std::string>(std::string(std::istreambuf_iterator<char>(ifs), {}));
+                module_sources_.push_back(std::move(sourceStr));
+
+                auto subCtx = std::make_unique<EvoParser::ParseContext>();
+                EvoParser::Parser parser;
+                EvoParser::ParseError importErr;
+
+                if (!parser.try_parse(*module_sources_.back(), *subCtx, importErr)) {
+                    ThrowTypeError("Syntax error in imported module '" + pkgName + "':\n" + importErr.what());
+                }
+
+                // Recursion: suspend current file, compile the import,
+                // then resume. compileAST saves/restores `ctx_` on its own.
+                compileAST(*subCtx, subCtx->root);
+
+                module_contexts_.push_back(std::move(subCtx));
+                continue;
+            }
+
+            if (nodeType == "Class" || nodeType == "Struct") {
+                std::string name = std::string(EvoParser::toString(declArr[1]));
+
+                // FEATURE: Strict Symbol Hygiene — reject duplicate global
+                // type declarations across the whole module (including
+                // imported files).
+                if (structs_.count(name)) ThrowTypeError("Invalid redeclaration of Type '" + name + "'.");
+                if (type_aliases_.count(name)) ThrowTypeError("Type '" + name + "' collides with an existing import alias.");
+
+                StructInfo& info = structs_[name];
+                info.type = llvm::StructType::create(*context_, name);
+                info.isReferenceType = (nodeType == "Class");
+                info.astMembers = declArr[3];
+
+                // FEATURE: Polymorphism — capture the inheritance clause.
+                // The parser emits superclass as an array of Identifiers so we
+                // accept both the array form and the plain StringView form for
+                // forward-compat. Only classes participate in inheritance.
+                if (nodeType == "Class" && !EvoParser::isNull(declArr[2])) {
+                    auto supVal = declArr[2];
+                    if (supVal.type == EvoParser::ValueType::StringView) {
+                        info.superclass = std::string(EvoParser::toString(supVal));
+                    } else if (supVal.type == EvoParser::ValueType::Array) {
+                        auto supArr = ctx_->getArrayElements(supVal);
+                        if (supArr.size > 0) {
+                            info.superclass = std::string(EvoParser::toString(supArr[0]));
+                        }
+                    }
+                }
+
+                // Register method signatures so Pass 3 can typecheck calls.
+                for (const auto& mem : ctx_->getArrayElements(info.astMembers)) {
+                    auto memArr = ctx_->getArrayElements(mem);
+                    if (memArr.size == 0) continue;
+                    std::string_view kind = EvoParser::toString(memArr[0]);
+                    if (kind != "Function" && kind != "StaticFunction") continue;
+
+                    bool isStaticMethod = (kind == "StaticFunction");
+                    std::string mName = name + "_" + std::string(EvoParser::toString(memArr[1]));
+                    FuncSig sig;
+                    sig.isStatic = isStaticMethod;
+                    // Only instance methods get the implicit `self`.
+                    if (!isStaticMethod) sig.argTypes.push_back(name);
+                    if (!EvoParser::isNull(memArr[2])) {
+                        for (const auto& param : ctx_->getArrayElements(memArr[2])) {
+                            sig.argTypes.push_back(std::string(EvoParser::toString(ctx_->getArrayElements(param)[2])));
+                        }
+                    }
+                    sig.retType = EvoParser::isNull(memArr[3]) ? "Void" : std::string(EvoParser::toString(memArr[3]));
+                    functions_[mName] = sig;
+                }
+            }
+            else if (nodeType == "Extern") {
+                std::string extName = std::string(EvoParser::toString(declArr[1]));
+
+                // The Prelude declares a handful of externs (printf, exit,
+                // sqrt, ...) that user scripts are still free to declare
+                // themselves. Swallow duplicate registrations so `extern
+                // func printf` in user code doesn't collide with the
+                // prelude-injected declaration (or with a previously
+                // emitted intrinsic like `getPrintf`'s shim).
+                if (functions_.count(extName)) continue;
+
+                FuncSig sig;
+                std::vector<llvm::Type*> argTypes;
+
+                if (!EvoParser::isNull(declArr[2])) {
+                    auto paramsArr = ctx_->getArrayElements(declArr[2]);
+                    for (const auto& param : paramsArr) {
+                        auto p = ctx_->getArrayElements(param);
+                        std::string pType = std::string(EvoParser::toString(p[2]));
+                        if (pType == "VarArg") sig.isVarArg = true;
+                        else {
+                            sig.argTypes.push_back(pType);
+                            argTypes.push_back(getLLVMType(pType));
+                        }
+                    }
+                }
+                sig.retType = EvoParser::isNull(declArr[3]) ? "Void" : std::string(EvoParser::toString(declArr[3]));
+                functions_[extName] = sig;
+
+                if (!module_->getFunction(extName)) {
+                    llvm::FunctionType* ft = llvm::FunctionType::get(getLLVMType(sig.retType), argTypes, sig.isVarArg);
+                    llvm::Function::Create(ft, llvm::Function::ExternalLinkage, extName, module_.get());
+                }
+            }
+        }
+
+        // Pass 2a: Register top-level function signatures (Pass 1 handled
+        // methods, structs, classes and externs already).
+        for (const auto& declVal : declarations) {
+            auto declArr = ctx_->getArrayElements(declVal);
+            if (declArr.size == 0) continue;
+            std::string_view nodeType = EvoParser::toString(declArr[0]);
+
+            if (nodeType == "Function") {
+                std::string name = std::string(EvoParser::toString(declArr[1]));
+
+                // FEATURE: Strict Symbol Hygiene — global function
+                // collision check spanning every imported file.
+                if (functions_.count(name)) ThrowTypeError("Invalid redeclaration of Global Function '" + name + "'.");
+
+                FuncSig sig;
+                if (!EvoParser::isNull(declArr[2])) {
+                    for (const auto& param : ctx_->getArrayElements(declArr[2])) {
+                        sig.argTypes.push_back(std::string(EvoParser::toString(ctx_->getArrayElements(param)[2])));
+                    }
+                }
+                sig.retType = EvoParser::isNull(declArr[3]) ? "Void" : std::string(EvoParser::toString(declArr[3]));
+                functions_[name] = sig;
+            }
+        }
+
+        // Pass 2b: Resolve class/struct memory layouts recursively so parent
+        // classes are laid out before their children.
+        for (const auto& declVal : declarations) {
+            auto declArr = ctx_->getArrayElements(declVal);
+            if (declArr.size == 0) continue;
+            std::string_view nodeType = EvoParser::toString(declArr[0]);
+            if (nodeType == "Class" || nodeType == "Struct") {
+                resolveLayout(std::string(EvoParser::toString(declArr[1])));
+            }
+        }
+
+        // Pass 3: Code Generation
+        pushScope(); // Global scope
+        for (const auto& declVal : declarations) {
+            auto declArr = ctx_->getArrayElements(declVal);
+            if (declArr.size == 0) continue;
+            std::string_view nodeType = EvoParser::toString(declArr[0]);
+
+            if (nodeType == "Function") {
+                compileFunction(declArr, "", nullptr);
+            } else if (nodeType == "Class" || nodeType == "Struct") {
+                std::string className = std::string(EvoParser::toString(declArr[1]));
+                auto members = ctx_->getArrayElements(declArr[3]);
+                for (const auto& mem : members) {
+                    auto memArr = ctx_->getArrayElements(mem);
+                    std::string_view memKind = EvoParser::toString(memArr[0]);
+                    if (memKind == "Function" || memKind == "StaticFunction") {
+                        compileFunction(memArr, className, structs_[className].type);
+                    }
+                }
+            }
+        }
+        popScope();
+
+        // Restore the caller's active parse context. V-Table globals are
+        // finalised in the outer `compile()` wrapper after every module
+        // has been merged into `structs_`.
+        ctx_ = savedCtx;
     }
 
     void dumpIR() { module_->print(llvm::outs(), nullptr); }
@@ -689,18 +817,23 @@ private:
         std::string name = std::string(EvoParser::toString(funcNode[1]));
         if (!className.empty()) name = className + "_" + name;
 
+        // FEATURE: Static Dispatch — a `static func` declared inside a
+        // class does not receive the implicit `self` first argument, and
+        // therefore isn't routed through the V-Table.
+        bool isStatic = (EvoParser::toString(funcNode[0]) == "StaticFunction");
+
         std::vector<llvm::Type*> argTypes;
         std::vector<std::string> argNames;
 
-        if (classType) {
+        if (classType && !isStatic) {
             argTypes.push_back(structs_[className].isReferenceType ? llvm::PointerType::getUnqual(*context_) : classType->getPointerTo());
             argNames.push_back("self");
         }
 
         if (!EvoParser::isNull(funcNode[2])) {
-            auto paramsArr = ctx_.getArrayElements(funcNode[2]);
+            auto paramsArr = ctx_->getArrayElements(funcNode[2]);
             for (const auto& param : paramsArr) {
-                auto p = ctx_.getArrayElements(param);
+                auto p = ctx_->getArrayElements(param);
                 argNames.push_back(std::string(EvoParser::toString(p[1])));
                 std::string pType = std::string(EvoParser::toString(p[2]));
                 argTypes.push_back(getLLVMType(pType));
@@ -725,7 +858,7 @@ private:
             defineVar(argName, {Alloca, argName == "self" ? className : functions_[name].argTypes[idx-1]});
         }
 
-        auto bodyArr = ctx_.getArrayElements(funcNode[4]);
+        auto bodyArr = ctx_->getArrayElements(funcNode[4]);
         for (const auto& stmt : bodyArr) compileStatement(stmt);
 
         popScope();
@@ -761,7 +894,7 @@ private:
             return {var->alloca, var->typeName};
         }
 
-        auto arr = ctx_.getArrayElements(expr);
+        auto arr = ctx_->getArrayElements(expr);
         if (arr.size > 0) {
             std::string_view nodeType = EvoParser::toString(arr[0]);
 
@@ -839,7 +972,7 @@ private:
     }
 
     void compileStatement(const EvoParser::Value& stmtVal) {
-        auto stmtArr = ctx_.getArrayElements(stmtVal);
+        auto stmtArr = ctx_->getArrayElements(stmtVal);
         if (stmtArr.size == 0) return;
 
         std::string_view nodeType = EvoParser::toString(stmtArr[0]);
@@ -868,7 +1001,7 @@ private:
                 // we skip compileExpression so the allocation/VTable wiring
                 // below knows which class to build.
                 if (rhs.type == EvoParser::ValueType::Array) {
-                    auto rhsArr = ctx_.getArrayElements(rhs);
+                    auto rhsArr = ctx_->getArrayElements(rhs);
                     if (EvoParser::toString(rhsArr[0]) == "Call" && rhsArr[1].type == EvoParser::ValueType::StringView) {
                         std::string callee = std::string(EvoParser::toString(rhsArr[1]));
                         if (structs_.count(callee)) {
@@ -1045,7 +1178,7 @@ private:
             builder_->CreateCondBr(condV, LoopBB, AfterBB);
 
             builder_->SetInsertPoint(LoopBB);
-            auto bodyArr = ctx_.getArrayElements(stmtArr[4]);
+            auto bodyArr = ctx_->getArrayElements(stmtArr[4]);
             for (const auto& s : bodyArr) compileStatement(s);
 
             llvm::Value* stepV = builder_->CreateAdd(builder_->CreateLoad(llvm::Type::getInt32Ty(*context_), Alloca), llvm::ConstantInt::get(*context_, llvm::APInt(32, 1, true)));
@@ -1070,7 +1203,7 @@ private:
             builder_->SetInsertPoint(ThenBB);
 
             pushScope(); // Block Scope
-            auto arr = ctx_.getArrayElements(stmtArr[2]);
+            auto arr = ctx_->getArrayElements(stmtArr[2]);
             for (const auto& s : arr) compileStatement(s);
             popScope();
 
@@ -1128,7 +1261,7 @@ private:
             return {builder_->CreateLoad(getLLVMType(var->typeName), var->alloca, varName.c_str()), var->typeName};
         }
 
-        auto exprArr = ctx_.getArrayElements(exprVal);
+        auto exprArr = ctx_->getArrayElements(exprVal);
         if (exprArr.size == 0) return {nullptr, ""};
         std::string_view nodeType = EvoParser::toString(exprArr[0]);
 
@@ -1171,7 +1304,7 @@ private:
         if (nodeType == "ArrayLiteral") {
             std::vector<llvm::Value*> elements;
             if (!EvoParser::isNull(exprArr[1])) {
-                auto argsArr = ctx_.getArrayElements(exprArr[1]);
+                auto argsArr = ctx_->getArrayElements(exprArr[1]);
                 for (const auto& arg : argsArr) {
                     TypedValue ev = compileExpression(arg);
                     if (ev.type != "Int") ThrowTypeError("Arrays currently only support 'Int' elements.");
@@ -1257,7 +1390,7 @@ private:
                     std::vector<llvm::Value*> argsV;
                     std::vector<llvm::Type*>  argLLTypes;
                     if (!EvoParser::isNull(exprArr[2])) {
-                        auto argsArr = ctx_.getArrayElements(exprArr[2]);
+                        auto argsArr = ctx_->getArrayElements(exprArr[2]);
                         for (size_t i = 0; i < argsArr.size; ++i) {
                             TypedValue argVal = compileExpression(argsArr[i]);
                             argsV.push_back(argVal.val);
@@ -1279,7 +1412,7 @@ private:
 
                 std::vector<llvm::Value*> argsV;
                 if (!EvoParser::isNull(exprArr[2])) {
-                    auto argsArr = ctx_.getArrayElements(exprArr[2]);
+                    auto argsArr = ctx_->getArrayElements(exprArr[2]);
 
                     if (!sig.isVarArg && argsArr.size != sig.argTypes.size()) ThrowTypeError("Function '" + callee + "' expects " + std::to_string(sig.argTypes.size()) + " arguments, but got " + std::to_string(argsArr.size));
 
@@ -1300,10 +1433,44 @@ private:
                 return {builder_->CreateCall(calleeF, argsV), sig.retType};
             }
             else {
-                auto targetArr = ctx_.getArrayElements(targetNode);
+                auto targetArr = ctx_->getArrayElements(targetNode);
                 if (EvoParser::toString(targetArr[0]) == "MemberAccess") {
                     std::string baseName = std::string(EvoParser::toString(targetArr[1]));
                     std::string methodName = std::string(EvoParser::toString(targetArr[2]));
+
+                    // FEATURE: Static method calls + `as` alias routing.
+                    // `Number.parseInt(...)` or `ML.square(...)` never
+                    // require an instance. Resolve the alias first so the
+                    // user-visible name maps onto the real struct, then
+                    // dispatch directly to `<Type>_<method>` when the
+                    // signature is marked `isStatic`. Falling through here
+                    // preserves normal instance-method dispatch for any
+                    // regular `func` that happens to share a base name
+                    // with a registered type.
+                    {
+                        std::string resolvedBase = resolveAlias(baseName);
+                        if (structs_.count(resolvedBase)) {
+                            std::string mangledName = resolvedBase + "_" + methodName;
+                            auto fit = functions_.find(mangledName);
+                            if (fit != functions_.end() && fit->second.isStatic) {
+                                FuncSig& sig = fit->second;
+
+                                std::vector<llvm::Value*> argsV;
+                                if (!EvoParser::isNull(exprArr[2])) {
+                                    auto argsArr = ctx_->getArrayElements(exprArr[2]);
+                                    for (size_t i = 0; i < argsArr.size; ++i) {
+                                        argsV.push_back(compileExpression(argsArr[i]).val);
+                                    }
+                                }
+
+                                llvm::Function* calleeF = module_->getFunction(mangledName);
+                                return {builder_->CreateCall(calleeF, argsV), sig.retType};
+                            }
+                            if (fit != functions_.end() && !fit->second.isStatic) {
+                                ThrowTypeError("'" + methodName + "' on '" + resolvedBase + "' is an instance method; call it on an instance (e.g. `var x = " + resolvedBase + "(); x." + methodName + "(...)`).");
+                            }
+                        }
+                    }
 
                     auto var = lookupVar(baseName);
                     if (!var) ThrowTypeError("Unknown variable '" + baseName + "'");
@@ -1321,7 +1488,7 @@ private:
                     // so the rest of the function sees a well-formed CFG.
                     if (var->typeName == "Array" && methodName == "append") {
                         if (EvoParser::isNull(exprArr[2])) ThrowTypeError("Array.append requires exactly one argument.");
-                        auto argsArr = ctx_.getArrayElements(exprArr[2]);
+                        auto argsArr = ctx_->getArrayElements(exprArr[2]);
                         if (argsArr.size != 1) ThrowTypeError("Array.append requires exactly one argument.");
                         TypedValue element = compileExpression(argsArr[0]);
                         if (element.type != "Int") ThrowTypeError("Array.append currently only supports 'Int' elements.");
@@ -1397,7 +1564,7 @@ private:
                             if (EvoParser::isNull(exprArr[2])) {
                                 ThrowTypeError("Memory." + methodName + " requires " + std::to_string(n) + " argument(s).");
                             }
-                            auto argsArr = ctx_.getArrayElements(exprArr[2]);
+                            auto argsArr = ctx_->getArrayElements(exprArr[2]);
                             if (argsArr.size != n) {
                                 ThrowTypeError("Memory." + methodName + " requires " + std::to_string(n) + " argument(s).");
                             }
@@ -1487,7 +1654,7 @@ private:
                     argsV.push_back(selfArg);
 
                     if (!EvoParser::isNull(exprArr[2])) {
-                        auto argsArr = ctx_.getArrayElements(exprArr[2]);
+                        auto argsArr = ctx_->getArrayElements(exprArr[2]);
                         for (size_t i = 0; i < argsArr.size; ++i) {
                             TypedValue arg = compileExpression(argsArr[i]);
                             // i+1 because sig.argTypes[0] is 'self'
@@ -1586,6 +1753,70 @@ private:
 
 #include <stdio.h>
 #include <cstring>
+
+// FEATURE: Cross-platform Thread shims.
+// The Prelude's `Thread` class targets the Windows C runtime + kernel32
+// APIs (`_beginthread`, `Sleep`, `WaitForSingleObject`). When the JIT
+// runs on a non-Windows host those symbols don't exist in any loaded
+// library, and LLJIT refuses to materialise the module even if no user
+// code actually calls Thread. We expose weak C-linkage stubs here so
+// `DynamicLibrarySearchGenerator::GetForCurrentProcess` resolves them
+// against this executable's symbol table on POSIX. On Windows the
+// matching msvcrt/kernel32 symbols already exist and will be preferred
+// by the linker, so these stubs only kick in for JIT-on-Linux / macOS.
+#if !defined(_WIN32)
+#include <pthread.h>
+#include <time.h>
+#include <mutex>
+#include <unordered_map>
+namespace {
+    // Bridge Win32-style `int` handles onto `pthread_t`. We hand the
+    // script a small integer id and track the real pthread here so
+    // WaitForSingleObject can `pthread_join` on the corresponding
+    // thread without exposing pthread_t (which is opaque on POSIX).
+    std::mutex g_threadMutex;
+    std::unordered_map<int, pthread_t> g_threadHandles;
+    int g_nextHandle = 1;
+}
+extern "C" {
+    __attribute__((weak)) int _beginthread(void (*start)(void), unsigned stack_size, void* arglist) {
+        (void)stack_size; (void)arglist;
+        pthread_t th;
+        struct Adapter {
+            static void* run(void* p) {
+                auto fn = reinterpret_cast<void (*)(void)>(p);
+                if (fn) fn();
+                return nullptr;
+            }
+        };
+        if (pthread_create(&th, nullptr, &Adapter::run, reinterpret_cast<void*>(start)) != 0) return 0;
+        std::lock_guard<std::mutex> g(g_threadMutex);
+        int handle = g_nextHandle++;
+        g_threadHandles[handle] = th;
+        return handle;
+    }
+    __attribute__((weak)) void Sleep(unsigned ms) {
+        struct timespec ts;
+        ts.tv_sec  = static_cast<time_t>(ms / 1000);
+        ts.tv_nsec = static_cast<long>((ms % 1000) * 1000000L);
+        nanosleep(&ts, nullptr);
+    }
+    __attribute__((weak)) int WaitForSingleObject(int handle, int ms) {
+        (void)ms;
+        pthread_t th;
+        {
+            std::lock_guard<std::mutex> g(g_threadMutex);
+            auto it = g_threadHandles.find(handle);
+            if (it == g_threadHandles.end()) return 0;
+            th = it->second;
+            g_threadHandles.erase(it);
+        }
+        pthread_join(th, nullptr);
+        return 0;
+    }
+}
+#endif
+
 int main(int argc, char** argv) {
     if (argc < 2) return 1;
 
@@ -1649,6 +1880,18 @@ extern func sqrt(x: Float) -> Float
 extern func pow(base: Float, exp: Float) -> Float
 extern func abs(x: Int) -> Int
 
+// --- 4. MULTITHREADING FFI BINDINGS ---
+// `_beginthread` / `Sleep` / `WaitForSingleObject` are the Windows C
+// runtime + Win32 kernel APIs used by the `Thread` class below. On the
+// Windows JIT target they resolve against msvcrt + kernel32 via the
+// dynamic symbol lookup. On non-Windows hosts the symbols obviously
+// don't exist, so scripts that actually *invoke* Thread will fail at
+// JIT symbol resolution rather than at parse time — which is what we
+// want, so the Prelude keeps compiling cleanly on every platform.
+extern func _beginthread(start: ()->Void, stack_size: Int, arglist: Int) -> Int
+extern func Sleep(ms: Int) -> Void
+extern func WaitForSingleObject(handle: Int, milliseconds: Int) -> Int
+
 // --- CORE GLOBALS ---
 func print(text: String) {
     printf(format: "%s\n", text)
@@ -1667,26 +1910,24 @@ func fatalError(msg: String) {
 // ELEGANT STANDARD LIBRARY CLASSES
 // ==========================================
 
-// Compiler metadata container. Kept as a plain class (not a static/global)
-// so users can stamp per-build info onto the instance — `version`, target
-// triple, build flavor, etc. — without the compiler reserving a singleton.
+// FEATURE: Static Dispatch — the Prelude's utility classes act as
+// static namespaces now that the language supports `static func`. No
+// instantiation required: call `Elegant.info()`, `Number.parseInt(...)`,
+// `Memory.alloc(...)` etc. directly on the type.
 class Elegant {
-    var version: String
-    var target: String
-
-    func info() {
-        printf(format: "Elegant Compiler %s | Target: %s\n", self.version, self.target)
+    static func info() {
+        printf(format: "Elegant Compiler v1.0.0 | Target: Native\n")
     }
 }
 
 // Thin veneer over `system` / `getenv` so scripts can spawn subprocesses
 // and query the environment without touching the raw FFI by hand.
 class OS {
-    func execute(command: String) -> Int {
+    static func execute(command: String) -> Int {
         return system(cmd: command)
     }
 
-    func getEnv(name: String) -> String {
+    static func getEnv(name: String) -> String {
         return getenv(name: name)
     }
 }
@@ -1703,25 +1944,17 @@ class IO {
 // the call sites — the LLVM backend intercepts those four methods and
 // emits raw inttoptr/ptrtoint/load/store instead of dispatching here.
 class Memory {
-    func alloc(bytes: Int) -> String {
+    static func alloc(bytes: Int) -> String {
         return malloc(size: bytes)
     }
 
-    func free(ptr: String) {
+    static func free(ptr: String) {
         free(ptr: ptr)
     }
 
-    func clear(ptr: String, bytes: Int) {
+    static func clear(ptr: String, bytes: Int) {
         memset(ptr: ptr, val: 0, num: bytes)
     }
-
-    // DANGER: UNRESTRICTED MEMORY INTRINSICS — backed by LLVM, not by
-    // these dummy bodies. The stubs are only here to satisfy the type
-    // checker; the real lowering happens in compileExpression.
-    func ptrToInt(ptr: String) -> Int { return 0 }
-    func intToPtr(address: Int) -> String { return "" }
-    func peek(address: Int) -> Int { return 0 }
-    func poke(address: Int, value: Int) {}
 }
 
 // `handle` is treated as a C `FILE*` — we hand it straight to fwrite/
@@ -1747,7 +1980,7 @@ class Files {
 // (ships with Windows 10+/macOS/most Linux distros). Keeps us out of the
 // raw-sockets business until we need a real networking story.
 class HTTP {
-    func download(url: String, outputFile: String) {
+    static func download(url: String, outputFile: String) {
         var cmd = "curl -s -L " + url + " -o " + outputFile
         printf(format: "Downloading: %s\n", url)
         system(cmd: cmd)
@@ -1757,27 +1990,49 @@ class HTTP {
 // Small utility belt for the common string <-> int conversions that our
 // minimal built-in operators can't express on their own.
 class Number {
-    func parseInt(str: String) -> Int {
+    static func parseInt(str: String) -> Int {
         return atoi(str: str)
     }
 
     // Int -> dynamically heap-allocated String. 32 bytes is enough for
     // any 32-bit integer's decimal representation plus a null terminator
     // with room to spare.
-    func toString(val: Int) -> String {
-        var mem = Memory()
-        var buffer = mem.alloc(bytes: 32)
+    static func toString(val: Int) -> String {
+        var buffer = Memory.alloc(bytes: 32)
         sprintf(buffer: buffer, format: "%d", val: val)
         return buffer
     }
 
     // We don't parse the `%` operator yet, so we simulate modulo using
     // integer division truncation: r - range * (r / range).
-    func random(min: Int, max: Int) -> Int {
+    static func random(min: Int, max: Int) -> Int {
         var r = rand()
         var range = (max - min) + 1
         var remainder = r - (range * (r / range))
         return min + remainder
+    }
+}
+
+// FEATURE: OS-Level Multithreading.
+// `Thread.spawn` hands a first-class function pointer to `_beginthread`
+// and returns an OS thread handle. `Thread.join` safely blocks the
+// calling thread until the worker signals completion via
+// `WaitForSingleObject` with the `INFINITE` sentinel (-1 / 0xFFFFFFFF).
+class Thread {
+    static func spawn(task: ()->Void) -> Int {
+        return _beginthread(start: task, stack_size: 0, arglist: 0)
+    }
+
+    static func sleep(ms: Int) {
+        Sleep(ms: ms)
+    }
+
+    static func join(handle: Int) {
+        // INFINITE = 0xFFFFFFFF, which is -1 interpreted as a signed 32-bit
+        // integer. The grammar has no unary-minus so we synthesise it via
+        // `0 - 1` to match WaitForSingleObject's signed-milliseconds ABI.
+        var infinite = 0 - 1
+        WaitForSingleObject(handle: handle, milliseconds: infinite)
     }
 }
 )ELEGANT";

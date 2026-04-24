@@ -30,5 +30,17 @@ add_executable(elegantc main.cpp ${CMAKE_CURRENT_BINARY_DIR}/ElegantParser.hpp)
 llvm_map_components_to_libnames(llvm_libs Core ExecutionEngine OrcJIT Support Target native)
 target_link_libraries(elegantc PRIVATE ${llvm_libs})
 
+# FEATURE: Cross-platform Thread shims — the weak C-linkage stubs
+# (_beginthread, Sleep, WaitForSingleObject) in main.cpp must be
+# visible to LLJIT's process-symbol generator on POSIX hosts so the
+# Prelude's Thread class can JIT even on Linux/macOS, where the Win32
+# APIs don't exist. On non-Windows we export all symbols; on Windows
+# the real msvcrt/kernel32 symbols resolve through the usual channels
+# and we don't need to alter visibility.
+if(NOT WIN32)
+    set_target_properties(elegantc PROPERTIES ENABLE_EXPORTS ON)
+    target_link_options(elegantc PRIVATE -rdynamic)
+endif()
+
 # Add the binary dir to includes so main.cpp can find ElegantParser.hpp
 target_include_directories(elegantc PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
