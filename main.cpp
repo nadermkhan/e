@@ -1619,7 +1619,7 @@ private:
                     // =====================================================
                     if (var->typeName == "Files" && methodName == "write") {
                         if (EvoParser::isNull(exprArr[2])) ThrowTypeError("Files.write requires one argument.");
-                        auto argsArr = ctx_.getArrayElements(exprArr[2]);
+                        auto argsArr = ctx_->getArrayElements(exprArr[2]);
                         if (argsArr.size != 1) ThrowTypeError("Files.write requires one argument.");
 
                         TypedValue data = compileExpression(argsArr[0]);
@@ -1719,6 +1719,21 @@ private:
                     return {builder_->CreateCall(fTy, funcPtr, argsV), sig.retType};
                 }
             }
+        }
+
+        // FEATURE: Unary operators. Currently just '-' for Int/Float
+        // negation, lowered to LLVM's `neg` / `fneg` so call sites can
+        // write `-1` directly instead of faking it with `0 - 1`.
+        if (nodeType == "Unary") {
+            std::string op = std::string(EvoParser::toString(exprArr[1]));
+            TypedValue expr = compileExpression(exprArr[2]);
+
+            if (op == "-") {
+                if (expr.type == "Int") return {builder_->CreateNeg(expr.val), "Int"};
+                if (expr.type == "Float") return {builder_->CreateFNeg(expr.val), "Float"};
+                ThrowTypeError("Unary operator '-' cannot be applied to type '" + expr.type + "'.");
+            }
+            ThrowTypeError("Unknown unary operator '" + op + "'.");
         }
 
         if (nodeType == "Binary") {
@@ -2067,7 +2082,8 @@ class Number {
     // any 32-bit integer's decimal representation plus a null terminator
     // with room to spare.
     static func toString(val: Int) -> String {
-        var buffer = Memory.alloc(bytes: 32)
+        var mem = Memory()
+        var buffer = mem.alloc(bytes: 32)
         sprintf(buffer: buffer, format: "%d", val: val)
         return buffer
     }
@@ -2098,10 +2114,9 @@ class Thread {
 
     static func join(handle: Int) {
         // INFINITE = 0xFFFFFFFF, which is -1 interpreted as a signed 32-bit
-        // integer. The grammar has no unary-minus so we synthesise it via
-        // `0 - 1` to match WaitForSingleObject's signed-milliseconds ABI.
-        var infinite = 0 - 1
-        WaitForSingleObject(handle: handle, milliseconds: infinite)
+        // integer. Lowered via the unary-minus operator to a CreateNeg on
+        // the i32 `1`, matching WaitForSingleObject's signed-milliseconds ABI.
+        WaitForSingleObject(handle: handle, milliseconds: -1)
     }
 }
 )ELEGANT";

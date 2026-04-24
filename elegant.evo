@@ -118,6 +118,13 @@ UnwrapExpr "Force Unwrap" = base:(MemberAccess / SubscriptAccess / Identifier) "
     return createArray(std::vector<EvoParser::Value>{ makeString("ForceUnwrap"), base });
 };
 
+// FEATURE: Unary Minus Operator (e.g. -1, -x, -(5+5)). Emitted by the
+// semantic analyzer as an LLVM `neg` / `fneg` instruction so negative
+// literals no longer require the `0 - x` workaround at call sites.
+UnaryExpr "Unary Expression" = op:"-" _ expr:PrimaryExpr {
+    return createArray(std::vector<EvoParser::Value>{ makeString("Unary"), op, expr });
+};
+
 ViewInstantiation "UI Element" = name:Identifier "(" _ args:CallArgs? ")" _ "{" _ children:Expression* "}" _ {
     return createArray(std::vector<EvoParser::Value>{ makeString("ViewNode"), name, args, children });
 };
@@ -139,7 +146,7 @@ BinaryExpr "Binary Operation" = left:PrimaryExpr op:Operator right:Expression {
     return createArray(std::vector<EvoParser::Value>{ makeString("Binary"), op, left, right });
 };
 
-PrimaryExpr "Primary" = UnwrapExpr / Literal / ArrayLiteral / MemberAccess / SubscriptAccess / Identifier / "(" _ @Expression ")" _ ;
+PrimaryExpr "Primary" = UnaryExpr / UnwrapExpr / Literal / ArrayLiteral / MemberAccess / SubscriptAccess / Identifier / "(" _ @Expression ")" _ ;
 
 ArrayLiteral "Array Literal" = "[" _ elements:CallArgs? "]" _ {
     return createArray(std::vector<EvoParser::Value>{ makeString("ArrayLiteral"), elements });
