@@ -114,11 +114,16 @@ public:
             if (hasRefs) {
                 llvm::BasicBlock* insertBB = builder_->GetInsertBlock();
                 if (insertBB) {
-                    // `getTerminator()` in LLVM 23 asserts on ill-formed
-                    // blocks and returns the last instruction unchecked in
-                    // release builds, so we guard with `hasTerminator()`
-                    // and only then pull the real terminator out.
-                    llvm::Instruction* term = insertBB->hasTerminator() ? insertBB->getTerminator() : nullptr;
+                    // Portable "does this block end in a terminator?" check:
+                    // LLVM 23's `getTerminator()` asserts (or in release
+                    // just returns `InstList.back()` unchecked) on ill-
+                    // formed blocks, and older LLVM installs (the MSYS2
+                    // UCRT64 toolchain used by the Windows CI) don't
+                    // expose `hasTerminator()` or `getTerminatorOrNull()`
+                    // at all. `empty()` + `Instruction::isTerminator()`
+                    // are stable across every supported LLVM version.
+                    bool hasTerm = !insertBB->empty() && insertBB->back().isTerminator();
+                    llvm::Instruction* term = hasTerm ? &insertBB->back() : nullptr;
                     llvm::BasicBlock*         savedBB = insertBB;
                     llvm::BasicBlock::iterator savedIt = builder_->GetInsertPoint();
                     if (term) builder_->SetInsertPoint(term);
@@ -729,13 +734,17 @@ private:
         // block rather than the entry block so functions whose last statement
         // lowered to a merge block (e.g. a trailing `if`) still get a
         // terminator and pass the IR verifier.
-        // `BasicBlock::getTerminator()` ASSERTS on ill-formed blocks in
-        // debug builds and in release (NDEBUG) just returns the last
-        // instruction regardless of whether it's actually a terminator,
-        // so we must use `hasTerminator()` here to correctly decide
-        // whether an implicit return still needs to be emitted.
+        // Decide whether this function already ends in a terminator. We
+        // have to do the check by hand because the LLVM surface area for
+        // "does this block have a terminator?" isn't portable across
+        // versions: LLVM 23's `getTerminator()` returns `InstList.back()`
+        // unchecked in release, and the older MSYS2 LLVM used by the
+        // Windows CI lacks both `hasTerminator()` and
+        // `getTerminatorOrNull()`. `empty()` + `Instruction::isTerminator()`
+        // have been stable since forever, so use those.
         llvm::BasicBlock* tailBB = builder_->GetInsertBlock();
-        if (tailBB && !tailBB->hasTerminator()) {
+        bool tailHasTerm = tailBB && !tailBB->empty() && tailBB->back().isTerminator();
+        if (tailBB && !tailHasTerm) {
             if (retTypeName == "Void") builder_->CreateRetVoid();
             else builder_->CreateRet(llvm::ConstantInt::get(*context_, llvm::APInt(32, 0, true)));
         }
