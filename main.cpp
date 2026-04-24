@@ -114,7 +114,7 @@ public:
             if (hasRefs) {
                 llvm::BasicBlock* insertBB = builder_->GetInsertBlock();
                 if (insertBB) {
-                    llvm::Instruction* term = insertBB->getTerminatorOrNull();
+                    llvm::Instruction* term = insertBB->getTerminator();
                     llvm::BasicBlock*         savedBB = insertBB;
                     llvm::BasicBlock::iterator savedIt = builder_->GetInsertPoint();
                     if (term) builder_->SetInsertPoint(term);
@@ -717,7 +717,7 @@ private:
         // lowered to a merge block (e.g. a trailing `if`) still get a
         // terminator and pass the IR verifier.
         llvm::BasicBlock* tailBB = builder_->GetInsertBlock();
-        if (tailBB && tailBB->getTerminatorOrNull() == nullptr) {
+        if (tailBB && tailBB->getTerminator() == nullptr) {
             if (retTypeName == "Void") builder_->CreateRetVoid();
             else builder_->CreateRet(llvm::ConstantInt::get(*context_, llvm::APInt(32, 0, true)));
         }
