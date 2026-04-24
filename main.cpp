@@ -697,6 +697,34 @@ private:
                 if (var->typeName != "Array") ThrowTypeError("Cannot subscript non-array type '" + var->typeName + "'");
 
                 llvm::Value* arrObj = builder_->CreateLoad(llvm::PointerType::getUnqual(*context_), var->alloca);
+
+                // FEATURE: Runtime array bounds checking. Reads the count from
+                // the Fat Pointer array header and traps before any GEP that
+                // could walk off the buffer. Replaces the C-style silent UB
+                // with a clean diagnostic + exit(1).
+                llvm::Value* countPtr = builder_->CreateStructGEP(getSwiftArrayType(), arrObj, 1);
+                llvm::Value* countVal = builder_->CreateLoad(llvm::Type::getInt32Ty(*context_), countPtr);
+
+                llvm::Value* isNeg = builder_->CreateICmpSLT(indexVal.val, llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context_), 0));
+                llvm::Value* isOut = builder_->CreateICmpSGE(indexVal.val, countVal);
+                llvm::Value* isOutOfBounds = builder_->CreateOr(isNeg, isOut);
+
+                llvm::Function* TheFunction = builder_->GetInsertBlock()->getParent();
+                llvm::BasicBlock* PanicBB = llvm::BasicBlock::Create(*context_, "bounds_panic", TheFunction);
+                llvm::BasicBlock* ContBB = llvm::BasicBlock::Create(*context_, "bounds_cont", TheFunction);
+
+                builder_->CreateCondBr(isOutOfBounds, PanicBB, ContBB);
+
+                builder_->SetInsertPoint(PanicBB);
+                llvm::Value* panicMsg = builder_->CreateGlobalString(
+                    "\n\033[31m\xF0\x9F\x9A\xA8 Fatal Error:\033[0m Array index out of bounds!\n",
+                    "bounds_panic_msg");
+                builder_->CreateCall(getPrintf(), {panicMsg});
+                builder_->CreateCall(getExit(), {llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context_), 1)});
+                builder_->CreateUnreachable();
+
+                builder_->SetInsertPoint(ContBB);
+
                 llvm::Value* bufPtrAddr = builder_->CreateStructGEP(getSwiftArrayType(), arrObj, 2);
                 llvm::Value* bufPtr = builder_->CreateLoad(llvm::PointerType::getUnqual(*context_), bufPtrAddr);
                 return {builder_->CreateGEP(llvm::Type::getInt32Ty(*context_), bufPtr, indexVal.val), "Int"};
@@ -1204,7 +1232,27 @@ private:
             if (op == "+") return {builder_->CreateAdd(L.val, R.val), "Int"};
             if (op == "-") return {builder_->CreateSub(L.val, R.val), "Int"};
             if (op == "*") return {builder_->CreateMul(L.val, R.val), "Int"};
-            if (op == "/") return {builder_->CreateSDiv(L.val, R.val), "Int"};
+            if (op == "/") {
+                // FEATURE: Runtime zero-division protection. Traps before the
+                // SDiv can raise SIGFPE, giving a clean diagnostic + exit(1).
+                llvm::Value* isZero = builder_->CreateICmpEQ(R.val, llvm::ConstantInt::get(*context_, llvm::APInt(32, 0, true)));
+                llvm::Function* TheFunction = builder_->GetInsertBlock()->getParent();
+                llvm::BasicBlock* PanicBB = llvm::BasicBlock::Create(*context_, "div_panic", TheFunction);
+                llvm::BasicBlock* ContBB = llvm::BasicBlock::Create(*context_, "div_cont", TheFunction);
+
+                builder_->CreateCondBr(isZero, PanicBB, ContBB);
+
+                builder_->SetInsertPoint(PanicBB);
+                llvm::Value* panicMsg = builder_->CreateGlobalString(
+                    "\n\033[31m\xF0\x9F\x9A\xA8 Fatal Error:\033[0m Division by zero.\n",
+                    "div_panic_msg");
+                builder_->CreateCall(getPrintf(), {panicMsg});
+                builder_->CreateCall(getExit(), {llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context_), 1)});
+                builder_->CreateUnreachable();
+
+                builder_->SetInsertPoint(ContBB);
+                return {builder_->CreateSDiv(L.val, R.val), "Int"};
+            }
 
             llvm::Value* cmp = nullptr;
             if (op == "==") cmp = builder_->CreateICmpEQ(L.val, R.val);
