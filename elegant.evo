@@ -112,6 +112,27 @@ ReturnStmt "Return" = "return" _ expr:Expression? {
 
 Expression "Expression" = ViewInstantiation / CallExpr / BinaryExpr / PrimaryExpr ;
 
+// FEATURE: First-Class Closures — Swift-style `{ x, y in body }` syntax
+// lowers to a "Thick Pointer" aggregate of { instruction_ptr, context_ptr }
+// at the LLVM level so referenced outer-scope variables are captured into
+// a heap-allocated context struct. The closure body is any Statement*.
+ClosureExpr "Closure" = "{" _ params:ClosureParamList? "in" _ body:Statement* "}" _ {
+    return createArray(std::vector<EvoParser::Value>{ makeString("Closure"), params, body });
+};
+
+// Exclude the `in` keyword from the parameter list so `{ in ... }`
+// (zero-param closure) doesn't accidentally parse `in` as an Identifier
+// and then choke on the missing separator. The `!("in" ![a-zA-Z0-9_])`
+// guard is a word-boundary-aware negative lookahead that lets `inVar`
+// or `intake` parse as regular identifiers.
+ClosureParamList "Closure Parameters" = !("in" ![a-zA-Z0-9_]) first:Identifier rest:ClosureParamRest* {
+    std::vector<EvoParser::Value> items;
+    items.push_back(first);
+    for (const auto& v : getArrayElements(rest)) items.push_back(v);
+    return createArray(items);
+};
+ClosureParamRest = "," _ !("in" ![a-zA-Z0-9_]) @Identifier ;
+
 // FEATURE: The Unwrap Expression (e.g. x!). Negative lookahead on '=' so the
 // postfix '!' never eats the leading '!' of the inequality operator '!='.
 UnwrapExpr "Force Unwrap" = base:(MemberAccess / SubscriptAccess / Identifier) "!" !"=" _ {
@@ -146,7 +167,7 @@ BinaryExpr "Binary Operation" = left:PrimaryExpr op:Operator right:Expression {
     return createArray(std::vector<EvoParser::Value>{ makeString("Binary"), op, left, right });
 };
 
-PrimaryExpr "Primary" = UnaryExpr / UnwrapExpr / Literal / ArrayLiteral / MemberAccess / SubscriptAccess / Identifier / "(" _ @Expression ")" _ ;
+PrimaryExpr "Primary" = ClosureExpr / UnaryExpr / UnwrapExpr / Literal / ArrayLiteral / MemberAccess / SubscriptAccess / Identifier / "(" _ @Expression ")" _ ;
 
 ArrayLiteral "Array Literal" = "[" _ elements:CallArgs? "]" _ {
     return createArray(std::vector<EvoParser::Value>{ makeString("ArrayLiteral"), elements });
