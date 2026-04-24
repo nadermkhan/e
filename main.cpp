@@ -1391,6 +1391,7 @@ private:
                     // =====================================================
                     if (var->typeName == "Memory") {
                         llvm::Type* i32Ty = llvm::Type::getInt32Ty(*context_);
+                        llvm::Type* i64Ty = llvm::Type::getInt64Ty(*context_);
                         llvm::Type* ptrTy = llvm::PointerType::getUnqual(*context_);
 
                         auto requireArgs = [&](size_t n) {
@@ -1404,6 +1405,16 @@ private:
                             return argsArr;
                         };
 
+                        // `alloc` routes through getMalloc() — see prelude note.
+                        // We zero-extend the i32 `Int` arg to i64 to match
+                        // the internal shim's `size_t` prototype.
+                        if (methodName == "alloc") {
+                            auto argsArr = requireArgs(1);
+                            TypedValue bytes = compileExpression(argsArr[0]);
+                            if (bytes.type != "Int") ThrowTypeError("Memory.alloc expects an Int size.");
+                            llvm::Value* bytes64 = builder_->CreateZExt(bytes.val, i64Ty);
+                            return {builder_->CreateCall(getMalloc(), {bytes64}), "String"};
+                        }
                         if (methodName == "ptrToInt") {
                             auto argsArr = requireArgs(1);
                             TypedValue ptr = compileExpression(argsArr[0]);
@@ -1428,6 +1439,45 @@ private:
                             builder_->CreateStore(val.val, rawPtr);
                             return {nullptr, "Void"};
                         }
+                    }
+
+                    // =====================================================
+                    // FEATURE: `Files.write` interceptor.
+                    //
+                    // Computes the payload length via the internal i64 strlen
+                    // shim (which would clash with a prelude-level i32 extern)
+                    // and emits a `fwrite(data, 1, len, self.handle)` call
+                    // against the i32-shaped FFI fwrite. The shim's wider
+                    // return type is truncated to `Int` on the Elegant side.
+                    // =====================================================
+                    if (var->typeName == "Files" && methodName == "write") {
+                        if (EvoParser::isNull(exprArr[2])) ThrowTypeError("Files.write requires one argument.");
+                        auto argsArr = ctx_.getArrayElements(exprArr[2]);
+                        if (argsArr.size != 1) ThrowTypeError("Files.write requires one argument.");
+
+                        TypedValue data = compileExpression(argsArr[0]);
+                        if (data.type != "String") ThrowTypeError("Files.write expects a String.");
+
+                        llvm::Type* i32Ty = llvm::Type::getInt32Ty(*context_);
+                        llvm::Type* ptrTy = llvm::PointerType::getUnqual(*context_);
+                        llvm::StructType* filesTy = structs_["Files"].type;
+
+                        llvm::Value* selfObj    = builder_->CreateLoad(ptrTy, var->alloca);
+                        llvm::Value* handleAddr = builder_->CreateStructGEP(filesTy, selfObj, structs_["Files"].fieldIndices["handle"]);
+                        llvm::Value* handle     = builder_->CreateLoad(ptrTy, handleAddr);
+
+                        llvm::Value* lenI64 = builder_->CreateCall(getStrLen(), {data.val});
+                        llvm::Value* lenI32 = builder_->CreateTrunc(lenI64, i32Ty);
+
+                        llvm::Function* fwrite = module_->getFunction("fwrite");
+                        if (!fwrite) ThrowTypeError("Missing fwrite declaration in prelude.");
+                        builder_->CreateCall(fwrite, {
+                            data.val,
+                            llvm::ConstantInt::get(i32Ty, 1),
+                            lenI32,
+                            handle
+                        });
+                        return {nullptr, "Void"};
                     }
 
                     auto sIt = structs_.find(var->typeName);
@@ -1625,14 +1675,19 @@ extern func getchar() -> Int
 // --- 2. MEMORY & FILE FFI BINDINGS ---
 // `String` is a raw `i8*` in LLVM IR, so it doubles as `void*` / `FILE*`
 // across the C ABI boundary — the type system just sees an opaque pointer.
-extern func malloc(size: Int) -> String
+//
+// Notably absent: `malloc` and `strlen`. Those names clash with internal
+// shims (`getMalloc` / `getStrLen`) that use the correct 64-bit `size_t`
+// prototypes. Exposing an i32-shaped version here poisons the shim cache
+// and makes callers emit malformed `add i32, i64` IR. `Memory.alloc` and
+// `Files.write` route through compileExpression interceptors below and
+// call the internal shims directly with proper zero-extension.
 extern func free(ptr: String) -> Void
 extern func memset(ptr: String, val: Int, num: Int) -> String
 extern func fopen(filename: String, mode: String) -> String
 extern func fclose(stream: String) -> Int
 extern func fwrite(ptr: String, size: Int, count: Int, stream: String) -> Int
 extern func fread(ptr: String, size: Int, count: Int, stream: String) -> Int
-extern func strlen(str: String) -> Int
 
 // --- 3. NUMBER UTILITY FFI BINDINGS ---
 // `sprintf` is declared with a fixed 3-arg shape because the compiler's
@@ -1703,9 +1758,11 @@ class IO {
 // the call sites — the LLVM backend intercepts those four methods and
 // emits raw inttoptr/ptrtoint/load/store instead of dispatching here.
 class Memory {
-    func alloc(bytes: Int) -> String {
-        return malloc(size: bytes)
-    }
+    // `alloc` is a compileExpression interceptor: the dummy body exists
+    // only to satisfy the type checker. At lowering time we emit a direct
+    // call to the internal `getMalloc()` shim with an i64-zero-extended
+    // size argument so we don't collide with the prelude-level extern.
+    func alloc(bytes: Int) -> String { return "" }
 
     func free(ptr: String) {
         free(ptr: ptr)
@@ -1718,6 +1775,10 @@ class Memory {
     // DANGER: UNRESTRICTED MEMORY INTRINSICS — backed by LLVM, not by
     // these dummy bodies. The stubs are only here to satisfy the type
     // checker; the real lowering happens in compileExpression.
+    //
+    // Known limitation: `Int` is i32 in Elegant, so `ptrToInt` truncates
+    // pointers on 64-bit targets and `peek` / `poke` can only address the
+    // low 4 GiB. Lifting this requires a language-level `Int64` type.
     func ptrToInt(ptr: String) -> Int { return 0 }
     func intToPtr(address: Int) -> String { return "" }
     func peek(address: Int) -> Int { return 0 }
@@ -1733,10 +1794,10 @@ class Files {
         self.handle = fopen(filename: path, mode: mode)
     }
 
-    func write(data: String) {
-        var length = strlen(str: data)
-        fwrite(ptr: data, size: 1, count: length, stream: self.handle)
-    }
+    // `write` is a compileExpression interceptor so we can use the
+    // internal `getStrLen()` shim (returning i64) without colliding with
+    // a prelude-level `extern func strlen`. The dummy body is unreachable.
+    func write(data: String) {}
 
     func close() {
         fclose(stream: self.handle)
