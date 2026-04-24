@@ -1376,6 +1376,60 @@ private:
                         return {nullptr, "Void"};
                     }
 
+                    // =====================================================
+                    // FEATURE: Raw Memory Intrinsics on `Memory`.
+                    //
+                    // Four methods on the stdlib `Memory` class are lowered
+                    // directly to LLVM instructions instead of going through
+                    // normal method dispatch: `ptrToInt` / `intToPtr` let
+                    // users round-trip between an `i8*` and an integer
+                    // address, and `peek` / `poke` dereference arbitrary
+                    // integer addresses as `i32` cells. The `Memory` stubs
+                    // in the Prelude exist only to pacify the semantic
+                    // checker — their bodies are never reached because we
+                    // short-circuit here.
+                    // =====================================================
+                    if (var->typeName == "Memory") {
+                        llvm::Type* i32Ty = llvm::Type::getInt32Ty(*context_);
+                        llvm::Type* ptrTy = llvm::PointerType::getUnqual(*context_);
+
+                        auto requireArgs = [&](size_t n) {
+                            if (EvoParser::isNull(exprArr[2])) {
+                                ThrowTypeError("Memory." + methodName + " requires " + std::to_string(n) + " argument(s).");
+                            }
+                            auto argsArr = ctx_.getArrayElements(exprArr[2]);
+                            if (argsArr.size != n) {
+                                ThrowTypeError("Memory." + methodName + " requires " + std::to_string(n) + " argument(s).");
+                            }
+                            return argsArr;
+                        };
+
+                        if (methodName == "ptrToInt") {
+                            auto argsArr = requireArgs(1);
+                            TypedValue ptr = compileExpression(argsArr[0]);
+                            return {builder_->CreatePtrToInt(ptr.val, i32Ty), "Int"};
+                        }
+                        if (methodName == "intToPtr") {
+                            auto argsArr = requireArgs(1);
+                            TypedValue addr = compileExpression(argsArr[0]);
+                            return {builder_->CreateIntToPtr(addr.val, ptrTy), "String"};
+                        }
+                        if (methodName == "peek") {
+                            auto argsArr = requireArgs(1);
+                            TypedValue addr = compileExpression(argsArr[0]);
+                            llvm::Value* rawPtr = builder_->CreateIntToPtr(addr.val, ptrTy);
+                            return {builder_->CreateLoad(i32Ty, rawPtr), "Int"};
+                        }
+                        if (methodName == "poke") {
+                            auto argsArr = requireArgs(2);
+                            TypedValue addr = compileExpression(argsArr[0]);
+                            TypedValue val  = compileExpression(argsArr[1]);
+                            llvm::Value* rawPtr = builder_->CreateIntToPtr(addr.val, ptrTy);
+                            builder_->CreateStore(val.val, rawPtr);
+                            return {nullptr, "Void"};
+                        }
+                    }
+
                     auto sIt = structs_.find(var->typeName);
                     if (sIt == structs_.end()) ThrowTypeError("Type '" + var->typeName + "' has no method '" + methodName + "'");
                     StructInfo& info = sIt->second;
@@ -1559,8 +1613,34 @@ int main(int argc, char** argv) {
     // their own `extern func printf`) are swallowed by the Extern pass.
     // =========================================================================
     std::string stdlib = R"ELEGANT(
+// --- 1. CORE OS FFI BINDINGS ---
+// These resolve against libc / msvcrt at runtime via the JIT's dynamic
+// symbol lookup. No special linking required on the user's end.
 extern func printf(format: String, ...) -> Void
 extern func exit(status: Int) -> Void
+extern func system(cmd: String) -> Int
+extern func getenv(name: String) -> String
+extern func getchar() -> Int
+
+// --- 2. MEMORY & FILE FFI BINDINGS ---
+// `String` is a raw `i8*` in LLVM IR, so it doubles as `void*` / `FILE*`
+// across the C ABI boundary — the type system just sees an opaque pointer.
+extern func malloc(size: Int) -> String
+extern func free(ptr: String) -> Void
+extern func memset(ptr: String, val: Int, num: Int) -> String
+extern func fopen(filename: String, mode: String) -> String
+extern func fclose(stream: String) -> Int
+extern func fwrite(ptr: String, size: Int, count: Int, stream: String) -> Int
+extern func fread(ptr: String, size: Int, count: Int, stream: String) -> Int
+extern func strlen(str: String) -> Int
+
+// --- 3. NUMBER UTILITY FFI BINDINGS ---
+// `sprintf` is declared with a fixed 3-arg shape because the compiler's
+// varargs support is reserved for stdlib-owned variadics like printf. A
+// fixed signature is enough for the integer formatting we actually need.
+extern func rand() -> Int
+extern func atoi(str: String) -> Int
+extern func sprintf(buffer: String, format: String, val: Int) -> Int
 
 // Math Library bindings — the OS math lib is linked in via the JIT's
 // dynamic symbol lookup, so `sqrt` and friends resolve against libm at
@@ -1569,6 +1649,7 @@ extern func sqrt(x: Float) -> Float
 extern func pow(base: Float, exp: Float) -> Float
 extern func abs(x: Int) -> Int
 
+// --- CORE GLOBALS ---
 func print(text: String) {
     printf(format: "%s\n", text)
 }
@@ -1580,6 +1661,124 @@ func printInt(val: Int) {
 func fatalError(msg: String) {
     printf(format: "\nFatal Error: %s\n", msg)
     exit(status: 1)
+}
+
+// ==========================================
+// ELEGANT STANDARD LIBRARY CLASSES
+// ==========================================
+
+// Compiler metadata container. Kept as a plain class (not a static/global)
+// so users can stamp per-build info onto the instance — `version`, target
+// triple, build flavor, etc. — without the compiler reserving a singleton.
+class Elegant {
+    var version: String
+    var target: String
+
+    func info() {
+        printf(format: "Elegant Compiler %s | Target: %s\n", self.version, self.target)
+    }
+}
+
+// Thin veneer over `system` / `getenv` so scripts can spawn subprocesses
+// and query the environment without touching the raw FFI by hand.
+class OS {
+    func execute(command: String) -> Int {
+        return system(cmd: command)
+    }
+
+    func getEnv(name: String) -> String {
+        return getenv(name: name)
+    }
+}
+
+class IO {
+    func readChar() -> Int {
+        return getchar()
+    }
+}
+
+// Manual heap management that completely sidesteps ARC. Useful for scratch
+// buffers, FFI handoff, and the raw-memory intrinsics below. The
+// ptrToInt/intToPtr/peek/poke stubs exist so the semantic checker accepts
+// the call sites — the LLVM backend intercepts those four methods and
+// emits raw inttoptr/ptrtoint/load/store instead of dispatching here.
+class Memory {
+    func alloc(bytes: Int) -> String {
+        return malloc(size: bytes)
+    }
+
+    func free(ptr: String) {
+        free(ptr: ptr)
+    }
+
+    func clear(ptr: String, bytes: Int) {
+        memset(ptr: ptr, val: 0, num: bytes)
+    }
+
+    // DANGER: UNRESTRICTED MEMORY INTRINSICS — backed by LLVM, not by
+    // these dummy bodies. The stubs are only here to satisfy the type
+    // checker; the real lowering happens in compileExpression.
+    func ptrToInt(ptr: String) -> Int { return 0 }
+    func intToPtr(address: Int) -> String { return "" }
+    func peek(address: Int) -> Int { return 0 }
+    func poke(address: Int, value: Int) {}
+}
+
+// `handle` is treated as a C `FILE*` — we hand it straight to fwrite/
+// fclose without ever dereferencing it on the Elegant side.
+class Files {
+    var handle: String
+
+    func open(path: String, mode: String) {
+        self.handle = fopen(filename: path, mode: mode)
+    }
+
+    func write(data: String) {
+        var length = strlen(str: data)
+        fwrite(ptr: data, size: 1, count: length, stream: self.handle)
+    }
+
+    func close() {
+        fclose(stream: self.handle)
+    }
+}
+
+// Lightweight HTTP client that shells out to the OS-native `curl` binary
+// (ships with Windows 10+/macOS/most Linux distros). Keeps us out of the
+// raw-sockets business until we need a real networking story.
+class HTTP {
+    func download(url: String, outputFile: String) {
+        var cmd = "curl -s -L " + url + " -o " + outputFile
+        printf(format: "Downloading: %s\n", url)
+        system(cmd: cmd)
+    }
+}
+
+// Small utility belt for the common string <-> int conversions that our
+// minimal built-in operators can't express on their own.
+class Number {
+    func parseInt(str: String) -> Int {
+        return atoi(str: str)
+    }
+
+    // Int -> dynamically heap-allocated String. 32 bytes is enough for
+    // any 32-bit integer's decimal representation plus a null terminator
+    // with room to spare.
+    func toString(val: Int) -> String {
+        var mem = Memory()
+        var buffer = mem.alloc(bytes: 32)
+        sprintf(buffer: buffer, format: "%d", val: val)
+        return buffer
+    }
+
+    // We don't parse the `%` operator yet, so we simulate modulo using
+    // integer division truncation: r - range * (r / range).
+    func random(min: Int, max: Int) -> Int {
+        var r = rand()
+        var range = (max - min) + 1
+        var remainder = r - (range * (r / range))
+        return min + remainder
+    }
 }
 )ELEGANT";
 
