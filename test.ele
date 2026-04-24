@@ -1,20 +1,9 @@
-struct Point {
-    var x: Int
-    var y: Int
-
-    func move(amount: Int) {
-        self.x = self.x + amount
-        self.y = self.y + amount
-    }
-}
+extern func printf(format: String, ...) -> Int
 
 func main() -> Int {
-    var p = Point()
+    var greeting = "Hello, World from Elegant Compiler!"
 
-    p.x = 10
-    p.y = 5
-
-    p.move(amount: 20)
-
-    return p.x + p.y
+    printf(format: "%s | Number: %d\n", greeting, 2026)
+    
+    return 0
 }

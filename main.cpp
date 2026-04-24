@@ -26,6 +26,7 @@
 // === LLVM ORC JIT Headers ===
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
 #include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
+#include <llvm/ExecutionEngine/Orc/ExecutionUtils.h> // Required for Host Process Linking
 
 #include <ElegantParser.hpp> 
 
@@ -59,10 +60,20 @@ public:
         builder_ = std::make_unique<llvm::IRBuilder<>>(*context_);
     }
 
+    // MAP AST TYPES TO LLVM RAM TYPES
+    llvm::Type* getLLVMType(const std::string& typeName) {
+        if (typeName == "Int") return llvm::Type::getInt32Ty(*context_);
+        if (typeName == "Float") return llvm::Type::getDoubleTy(*context_);
+        if (typeName == "String") return llvm::PointerType::getUnqual(*context_); // i8* for Strings
+        if (typeName == "Void" || typeName == "") return llvm::Type::getVoidTy(*context_);
+        if (structs_.count(typeName)) return structs_[typeName].type->getPointerTo();
+        return llvm::Type::getInt32Ty(*context_); // Default fallback
+    }
+
     void compile() {
         auto declarations = ctx_.getArrayElements(ctx_.root);
         
-        // PASS 1: Struct / Class Blueprint Registration
+        // PASS 1: Struct / Extern Registration
         for (const auto& declVal : declarations) {
             auto declArr = ctx_.getArrayElements(declVal);
             if (declArr.size == 0) continue;
@@ -72,9 +83,29 @@ public:
                 std::string name = std::string(EvoParser::toString(declArr[1]));
                 structs_[name].type = llvm::StructType::create(*context_, name);
             }
+            // FEATURE: FFI LINKAGE
+            else if (nodeType == "Extern") {
+                std::string extName = std::string(EvoParser::toString(declArr[1]));
+                std::vector<llvm::Type*> argTypes;
+                bool isVarArg = false;
+
+                if (!EvoParser::isNull(declArr[2])) {
+                    auto paramsArr = ctx_.getArrayElements(declArr[2]);
+                    for (const auto& param : paramsArr) {
+                        auto p = ctx_.getArrayElements(param);
+                        std::string pType = std::string(EvoParser::toString(p[2]));
+                        if (pType == "VarArg") isVarArg = true;
+                        else argTypes.push_back(getLLVMType(pType));
+                    }
+                }
+                
+                std::string retTypeName = EvoParser::isNull(declArr[3]) ? "Void" : std::string(EvoParser::toString(declArr[3]));
+                llvm::FunctionType* ft = llvm::FunctionType::get(getLLVMType(retTypeName), argTypes, isVarArg);
+                llvm::Function::Create(ft, llvm::Function::ExternalLinkage, extName, module_.get());
+            }
         }
         
-        // PASS 2: Memory Layout Mapping (Assigning Memory Offsets to Properties)
+        // PASS 2: Memory Layout Mapping
         for (const auto& declVal : declarations) {
             auto declArr = ctx_.getArrayElements(declVal);
             if (declArr.size == 0) continue;
@@ -90,15 +121,16 @@ public:
                     auto memArr = ctx_.getArrayElements(mem);
                     if (EvoParser::toString(memArr[0]) == "Property") {
                         std::string propName = std::string(EvoParser::toString(memArr[2]));
+                        std::string propType = EvoParser::isNull(memArr[3]) ? "Int" : std::string(EvoParser::toString(memArr[3]));
                         info.fieldIndices[propName] = idx++;
-                        info.fieldTypes.push_back(llvm::Type::getInt32Ty(*context_)); // Simplifying to i32 properties
+                        info.fieldTypes.push_back(getLLVMType(propType)); 
                     }
                 }
                 info.type->setBody(info.fieldTypes);
             }
         }
         
-        // PASS 3: Generate Executable Code (Functions & Methods)
+        // PASS 3: Generate Executable Code
         for (const auto& declVal : declarations) {
             auto declArr = ctx_.getArrayElements(declVal);
             if (declArr.size == 0) continue;
@@ -112,7 +144,6 @@ public:
                 for (const auto& mem : members) {
                     auto memArr = ctx_.getArrayElements(mem);
                     if (EvoParser::toString(memArr[0]) == "Function") {
-                        // Methods get compiled with an implicit 'self' pointer!
                         compileFunction(memArr, className, structs_[className].type);
                     }
                 }
@@ -133,12 +164,16 @@ public:
 
         module_->setDataLayout(jit->getDataLayout());
 
+        // FEATURE: LINK JIT WITH WINDOWS HOST PROCESS (Enables stdio.h printf!)
+        auto processSymbols = llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(jit->getDataLayout().getGlobalPrefix());
+        if (processSymbols) jit->getMainJITDylib().addGenerator(std::move(*processSymbols));
+
         auto tsm = llvm::orc::ThreadSafeModule(std::move(module_), std::move(context_));
         if (auto err = jit->addIRModule(std::move(tsm))) return 1;
 
         auto mainSym = jit->lookup("main");
         if (!mainSym) {
-            llvm::errs() << "\n\xE2\x9D\x8C Execution Error: Could not find 'func main()' to execute.\n";
+            llvm::errs() << "\n❌ Execution Error: Could not find 'func main()' to execute.\n";
             return 1;
         }
 
@@ -186,12 +221,11 @@ private:
 
     llvm::Function* compileFunction(const EvoParser::ArrayView& funcNode, std::string className, llvm::StructType* classType) {
         std::string name = std::string(EvoParser::toString(funcNode[1]));
-        if (!className.empty()) name = className + "_" + name; // e.g. "Point_move"
+        if (!className.empty()) name = className + "_" + name; 
         
         std::vector<llvm::Type*> argTypes;
         std::vector<std::string> argNames;
         
-        // INJECT HIDDEN "self" POINTER FOR OOP METHODS
         if (classType) {
             argTypes.push_back(classType->getPointerTo());
             argNames.push_back("self");
@@ -202,11 +236,13 @@ private:
             for (const auto& param : paramsArr) {
                 auto p = ctx_.getArrayElements(param);
                 argNames.push_back(std::string(EvoParser::toString(p[1])));
-                argTypes.push_back(llvm::Type::getInt32Ty(*context_));
+                std::string pType = std::string(EvoParser::toString(p[2]));
+                argTypes.push_back(getLLVMType(pType));
             }
         }
 
-        llvm::FunctionType* ft = llvm::FunctionType::get(llvm::Type::getInt32Ty(*context_), argTypes, false);
+        std::string retTypeName = EvoParser::isNull(funcNode[3]) ? "Void" : std::string(EvoParser::toString(funcNode[3]));
+        llvm::FunctionType* ft = llvm::FunctionType::get(getLLVMType(retTypeName), argTypes, false);
         llvm::Function* f = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, name, module_.get());
 
         llvm::BasicBlock* bb = llvm::BasicBlock::Create(*context_, "entry", f);
@@ -229,7 +265,6 @@ private:
         return f;
     }
 
-    // Helper: Calculates the exact memory address in RAM for a variable or struct property
     llvm::Value* compileLValue(const EvoParser::Value& expr, std::string& outTypeName) {
         if (expr.type == EvoParser::ValueType::StringView) {
             std::string varName = std::string(EvoParser::toString(expr));
@@ -242,8 +277,6 @@ private:
         auto arr = ctx_.getArrayElements(expr);
         if (arr.size > 0) {
             std::string_view nodeType = EvoParser::toString(arr[0]);
-            
-            // External struct access: p.x
             if (nodeType == "MemberAccess") {
                 std::string baseName = std::string(EvoParser::toString(arr[1]));
                 std::string propName = std::string(EvoParser::toString(arr[2]));
@@ -259,7 +292,6 @@ private:
                 outTypeName = "Int";
                 return builder_->CreateStructGEP(info.type, it->second.alloca, idx, propName + "_ptr");
             }
-            // Internal method access: self.x
             else if (nodeType == "SelfAccess") {
                 std::string propName = std::string(EvoParser::toString(arr[1]));
                 auto it = named_values_.find("self");
@@ -294,26 +326,28 @@ private:
             std::string varName = std::string(EvoParser::toString(stmtArr[2]));
             std::string varType = "Int"; 
             
-            // Allow explicit typing (var x: Point)
             if (!EvoParser::isNull(stmtArr[3])) varType = std::string(EvoParser::toString(stmtArr[3]));
             
             llvm::Value* initVal = nullptr;
             if (!EvoParser::isNull(stmtArr[4])) {
                 auto rhs = stmtArr[4];
-                // Type Inference for Constructors (var p = Point())
+                bool typeExplicit = !EvoParser::isNull(stmtArr[3]);
                 if (rhs.type == EvoParser::ValueType::Array) {
                     auto rhsArr = ctx_.getArrayElements(rhs);
-                    if (EvoParser::toString(rhsArr[0]) == "Call" && rhsArr[1].type == EvoParser::ValueType::StringView) {
+                    std::string_view rhsKind = EvoParser::toString(rhsArr[0]);
+                    if (rhsKind == "Call" && rhsArr[1].type == EvoParser::ValueType::StringView) {
                         std::string callee = std::string(EvoParser::toString(rhsArr[1]));
-                        if (structs_.count(callee)) varType = callee; 
+                        if (structs_.count(callee)) varType = callee;
+                    } else if (!typeExplicit) {
+                        if (rhsKind == "String") varType = "String";
+                        else if (rhsKind == "Float") varType = "Float";
+                        else if (rhsKind == "Bool") varType = "Int";
                     }
                 }
-                
-                // Standard expressions
                 if (!structs_.count(varType)) initVal = compileExpression(rhs);
             }
 
-            llvm::Type* llvmTy = llvm::Type::getInt32Ty(*context_);
+            llvm::Type* llvmTy = getLLVMType(varType);
             if (structs_.count(varType)) llvmTy = structs_[varType].type;
 
             llvm::Function* TheFunction = builder_->GetInsertBlock()->getParent();
@@ -334,7 +368,6 @@ private:
             return rhsVal;
         }
 
-        // Control Flow: If/While remain unchanged
         if (nodeType == "If") {
             llvm::Value* condV = compileExpression(stmtArr[1]);
             condV = builder_->CreateICmpNE(condV, llvm::ConstantInt::get(*context_, llvm::APInt(32, 0, true)), "ifcond");
@@ -387,6 +420,7 @@ private:
             return nullptr;
         }
 
+        // Implicit Call (Standalone expression)
         return compileExpression(stmtVal);
     }
 
@@ -395,13 +429,41 @@ private:
             std::string varName = std::string(EvoParser::toString(exprVal));
             auto it = named_values_.find(varName);
             if (it == named_values_.end()) { llvm::errs() << "Unknown var: " << varName << "\n"; return nullptr; }
-            return builder_->CreateLoad(llvm::Type::getInt32Ty(*context_), it->second.alloca, varName.c_str());
+            
+            llvm::Type* ty = getLLVMType(it->second.typeName);
+            return builder_->CreateLoad(ty, it->second.alloca, varName.c_str());
         }
 
         auto exprArr = ctx_.getArrayElements(exprVal);
         if (exprArr.size == 0) return nullptr;
 
         std::string_view nodeType = EvoParser::toString(exprArr[0]);
+
+        // FEATURE: LOWER STRINGS TO GLOBAL CONSTANT MEMORY
+        if (nodeType == "String") {
+            std::string raw = std::string(EvoParser::toString(exprArr[1]));
+            std::string val;
+            val.reserve(raw.size());
+            for (size_t i = 0; i < raw.size(); ++i) {
+                char c = raw[i];
+                if (c == '\\' && i + 1 < raw.size()) {
+                    char nxt = raw[++i];
+                    switch (nxt) {
+                        case 'n': val.push_back('\n'); break;
+                        case 't': val.push_back('\t'); break;
+                        case 'r': val.push_back('\r'); break;
+                        case '0': val.push_back('\0'); break;
+                        case '\\': val.push_back('\\'); break;
+                        case '"': val.push_back('"'); break;
+                        case '\'': val.push_back('\''); break;
+                        default: val.push_back('\\'); val.push_back(nxt); break;
+                    }
+                } else {
+                    val.push_back(c);
+                }
+            }
+            return builder_->CreateGlobalString(val, "str");
+        }
 
         if (nodeType == "MemberAccess" || nodeType == "SelfAccess") {
             std::string dummyType;
@@ -418,10 +480,9 @@ private:
         if (nodeType == "Call") {
             auto targetNode = exprArr[1];
             
-            // Standard Function Call: calculate()
             if (targetNode.type == EvoParser::ValueType::StringView) {
                 std::string callee = std::string(EvoParser::toString(targetNode));
-                if (structs_.count(callee)) return nullptr; // It's a constructor init, handled in Property
+                if (structs_.count(callee)) return nullptr; 
 
                 llvm::Function* calleeF = module_->getFunction(callee);
                 if (!calleeF) { llvm::errs() << "Unknown function: " << callee << "\n"; return nullptr; }
@@ -433,7 +494,6 @@ private:
                 }
                 return builder_->CreateCall(calleeF, argsV, "calltmp");
             } 
-            // OOP Method Call: p.move()
             else {
                 auto targetArr = ctx_.getArrayElements(targetNode);
                 if (EvoParser::toString(targetArr[0]) == "MemberAccess") {
@@ -443,12 +503,11 @@ private:
                     auto it = named_values_.find(baseName);
                     std::string typeName = it->second.typeName;
                     
-                    // Route to the mangled static method
                     llvm::Function* calleeF = module_->getFunction(typeName + "_" + methodName);
                     if (!calleeF) { llvm::errs() << "Unknown method: " << methodName << "\n"; return nullptr; }
                     
                     std::vector<llvm::Value*> argsV;
-                    argsV.push_back(it->second.alloca); // Inject implicit 'self'
+                    argsV.push_back(it->second.alloca); 
                     
                     if (!EvoParser::isNull(exprArr[2])) {
                         auto argsArr = ctx_.getArrayElements(exprArr[2]);
@@ -487,6 +546,9 @@ private:
 
 } // namespace Elegant
 
+// We include standard C headers to ensure they are loaded into the host process for the JIT to find
+#include <stdio.h>
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cout << "Elegant Compiler Toolchain\n";
@@ -512,7 +574,7 @@ int main(int argc, char** argv) {
     EvoParser::ParseError err;
 
     if (!parser.try_parse(source, ctx, err)) {
-        std::cerr << "\n\xE2\x9D\x8C Syntax Error\n" << err.what() << "\n";
+        std::cerr << "\n❌ Syntax Error\n" << err.what() << "\n";
         return 1;
     }
 
@@ -530,8 +592,12 @@ int main(int argc, char** argv) {
         std::string exe_file = moduleName + ".exe";
 
         if (compiler.emitObjectFile(obj_file)) {
-            std::string linkCmd = "lld-link.exe " + obj_file + " /entry:main /subsystem:console /nodefaultlib /out:" + exe_file;
+            std::cout << "✅ Emitted native object: " << obj_file << "\n";
+            std::cout << "🚀 Linking standalone executable...\n";
+            // For standard library linkage, we drop /nodefaultlib and use the host compiler libraries
+            std::string linkCmd = "lld-link.exe " + obj_file + " /entry:main /subsystem:console /out:" + exe_file + " /defaultlib:msvcrt.lib /defaultlib:ucrt.lib /defaultlib:kernel32.lib";
             std::system(linkCmd.c_str());
+            std::cout << "✅ Built executable: " << exe_file << "\n";
         }
     }
     return 0;
