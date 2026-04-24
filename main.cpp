@@ -2777,14 +2777,24 @@ class Thread {
                     ? bundledLinker.string()
                     : std::string("lld-link.exe");
 
+            // std::system() on Windows delegates to `cmd.exe /c <cmd>`, which
+            // has a well-known quirk: if the command starts with `"` and
+            // contains more than two quote characters, cmd.exe strips the
+            // first and last `"` before dispatch — shredding the quoting we
+            // carefully put around the linker path, the object file, the
+            // output path, and the libpath (any of which may contain spaces
+            // on a typical Windows user's Desktop / Downloads folder). The
+            // canonical fix is to wrap the entire command in an outer pair
+            // of quotes so cmd.exe strips *those* instead and our inner
+            // quoting survives verbatim.
             std::string linkCmd =
-                "\"" + linker + "\" \"" + obj_file + "\""
+                "\"\"" + linker + "\" \"" + obj_file + "\""
                 " /entry:main /subsystem:console"
                 " /out:\"" + exe_file + "\""
                 " /libpath:\"" + bundledLibs.string() + "\""
                 " /defaultlib:ucrt.lib"
                 " /defaultlib:kernel32.lib"
-                " /defaultlib:msvcrt.lib";
+                " /defaultlib:msvcrt.lib\"";
 
             int rc = std::system(linkCmd.c_str());
             if (rc != 0) {
