@@ -164,6 +164,38 @@ public:
         return llvm::Function::Create(FT, llvm::Function::ExternalLinkage, "printf", module_.get());
     }
 
+    // FEATURE: Native Heap String Concatenation — expose libc string helpers
+    // so the `+` operator on `String` can allocate a fresh buffer with
+    // `malloc` and stitch both operands together via `strcpy`/`strcat`.
+    llvm::Function* getStrLen() {
+        if (auto* F = module_->getFunction("strlen")) return F;
+        return llvm::Function::Create(
+            llvm::FunctionType::get(llvm::Type::getInt64Ty(*context_), {llvm::PointerType::getUnqual(*context_)}, false),
+            llvm::Function::ExternalLinkage, "strlen", module_.get());
+    }
+    llvm::Function* getStrCpy() {
+        if (auto* F = module_->getFunction("strcpy")) return F;
+        return llvm::Function::Create(
+            llvm::FunctionType::get(llvm::PointerType::getUnqual(*context_), {llvm::PointerType::getUnqual(*context_), llvm::PointerType::getUnqual(*context_)}, false),
+            llvm::Function::ExternalLinkage, "strcpy", module_.get());
+    }
+    llvm::Function* getStrCat() {
+        if (auto* F = module_->getFunction("strcat")) return F;
+        return llvm::Function::Create(
+            llvm::FunctionType::get(llvm::PointerType::getUnqual(*context_), {llvm::PointerType::getUnqual(*context_), llvm::PointerType::getUnqual(*context_)}, false),
+            llvm::Function::ExternalLinkage, "strcat", module_.get());
+    }
+
+    // FEATURE: Dynamic Array Resizing — expose libc `realloc` so `append`
+    // can grow a Swift-style Array's heap buffer when it runs out of
+    // capacity, without copying or manually re-allocating the struct.
+    llvm::Function* getRealloc() {
+        if (auto* F = module_->getFunction("realloc")) return F;
+        return llvm::Function::Create(
+            llvm::FunctionType::get(llvm::PointerType::getUnqual(*context_), {llvm::PointerType::getUnqual(*context_), llvm::Type::getInt64Ty(*context_)}, false),
+            llvm::Function::ExternalLinkage, "realloc", module_.get());
+    }
+
     llvm::Function* getExit() {
         if (auto* E = module_->getFunction("exit")) return E;
         auto* FT = llvm::FunctionType::get(llvm::Type::getVoidTy(*context_), {llvm::Type::getInt32Ty(*context_)}, false);
@@ -384,7 +416,11 @@ public:
             return llvm::StructType::get(*context_, {llvm::Type::getInt1Ty(*context_), innerTy});
         }
 
-        if (typeName == "Int") return llvm::Type::getInt32Ty(*context_);
+        // FEATURE: Standard Library Types — `Bool` is lowered to `i32` under
+        // the hood so it can flow through the existing Int-shaped code paths
+        // (comparisons, conditionals, parameter passing) without special
+        // casing. `true` is `1`, `false` is `0`.
+        if (typeName == "Int" || typeName == "Bool") return llvm::Type::getInt32Ty(*context_);
         if (typeName == "Float") return llvm::Type::getDoubleTy(*context_);
         if (typeName == "String") return llvm::PointerType::getUnqual(*context_);
         if (typeName == "Array") return llvm::PointerType::getUnqual(*context_);
@@ -453,6 +489,15 @@ public:
             }
             else if (nodeType == "Extern") {
                 std::string extName = std::string(EvoParser::toString(declArr[1]));
+
+                // The Prelude declares a handful of externs (printf, exit,
+                // sqrt, ...) that user scripts are still free to declare
+                // themselves. Swallow duplicate registrations so `extern
+                // func printf` in user code doesn't collide with the
+                // prelude-injected declaration (or with a previously
+                // emitted intrinsic like `getPrintf`'s shim).
+                if (functions_.count(extName)) continue;
+
                 FuncSig sig;
                 std::vector<llvm::Type*> argTypes;
 
@@ -471,8 +516,10 @@ public:
                 sig.retType = EvoParser::isNull(declArr[3]) ? "Void" : std::string(EvoParser::toString(declArr[3]));
                 functions_[extName] = sig;
 
-                llvm::FunctionType* ft = llvm::FunctionType::get(getLLVMType(sig.retType), argTypes, sig.isVarArg);
-                llvm::Function::Create(ft, llvm::Function::ExternalLinkage, extName, module_.get());
+                if (!module_->getFunction(extName)) {
+                    llvm::FunctionType* ft = llvm::FunctionType::get(getLLVMType(sig.retType), argTypes, sig.isVarArg);
+                    llvm::Function::Create(ft, llvm::Function::ExternalLinkage, extName, module_.get());
+                }
             }
         }
 
@@ -665,8 +712,12 @@ private:
 
         popScope();
 
-        // Implicit return if none found
-        if (bb->getTerminatorOrNull() == nullptr) {
+        // Implicit return if none found. We must check the *current* insert
+        // block rather than the entry block so functions whose last statement
+        // lowered to a merge block (e.g. a trailing `if`) still get a
+        // terminator and pass the IR verifier.
+        llvm::BasicBlock* tailBB = builder_->GetInsertBlock();
+        if (tailBB && tailBB->getTerminatorOrNull() == nullptr) {
             if (retTypeName == "Void") builder_->CreateRetVoid();
             else builder_->CreateRet(llvm::ConstantInt::get(*context_, llvm::APInt(32, 0, true)));
         }
@@ -1107,6 +1158,15 @@ private:
             return {llvm::ConstantInt::get(*context_, llvm::APInt(32, std::stoi(std::string(EvoParser::toString(exprArr[1]))), true)), "Int"};
         }
 
+        // FEATURE: Standard Library Booleans — `true`/`false` keywords
+        // compile down to constant `i32` values tagged with the `Bool` type
+        // so the type system can reject non-boolean conditions even though
+        // the underlying storage is shared with `Int`.
+        if (nodeType == "Bool") {
+            int val = (std::string(EvoParser::toString(exprArr[1])) == "true") ? 1 : 0;
+            return {llvm::ConstantInt::get(*context_, llvm::APInt(32, val, true)), "Bool"};
+        }
+
         if (nodeType == "Call") {
             auto targetNode = exprArr[1];
             if (targetNode.type == EvoParser::ValueType::StringView) {
@@ -1146,6 +1206,74 @@ private:
 
                     auto var = lookupVar(baseName);
                     if (!var) ThrowTypeError("Unknown variable '" + baseName + "'");
+
+                    // FEATURE: Dynamic Array Resizing via `Array.append`.
+                    // Arrays live on the heap as `{ i32 capacity, i32 count,
+                    // i8* buffer }`. When the user calls `.append(x)` we
+                    // compare the current count against the capacity. If
+                    // they match, we double the capacity and `realloc` the
+                    // backing buffer in place. The post-realloc buffer
+                    // pointer is re-loaded from the struct because realloc
+                    // is allowed to return a fresh address. Finally we
+                    // store the new element at `buffer[count]` and bump the
+                    // count. All branches rejoin at a single append block
+                    // so the rest of the function sees a well-formed CFG.
+                    if (var->typeName == "Array" && methodName == "append") {
+                        if (EvoParser::isNull(exprArr[2])) ThrowTypeError("Array.append requires exactly one argument.");
+                        auto argsArr = ctx_.getArrayElements(exprArr[2]);
+                        if (argsArr.size != 1) ThrowTypeError("Array.append requires exactly one argument.");
+                        TypedValue element = compileExpression(argsArr[0]);
+                        if (element.type != "Int") ThrowTypeError("Array.append currently only supports 'Int' elements.");
+
+                        llvm::Type* ptrTy = llvm::PointerType::getUnqual(*context_);
+                        llvm::Type* i32Ty = llvm::Type::getInt32Ty(*context_);
+                        llvm::Type* i64Ty = llvm::Type::getInt64Ty(*context_);
+                        llvm::StructType* arrTy = getSwiftArrayType();
+
+                        llvm::Value* arrObj = builder_->CreateLoad(ptrTy, var->alloca);
+                        llvm::Value* capPtr     = builder_->CreateStructGEP(arrTy, arrObj, 0);
+                        llvm::Value* countPtr   = builder_->CreateStructGEP(arrTy, arrObj, 1);
+                        llvm::Value* bufPtrAddr = builder_->CreateStructGEP(arrTy, arrObj, 2);
+
+                        llvm::Value* capacity = builder_->CreateLoad(i32Ty, capPtr);
+                        llvm::Value* count    = builder_->CreateLoad(i32Ty, countPtr);
+                        llvm::Value* buffer   = builder_->CreateLoad(ptrTy, bufPtrAddr);
+
+                        llvm::Value* isFull = builder_->CreateICmpEQ(count, capacity);
+
+                        llvm::Function* TheFunction = builder_->GetInsertBlock()->getParent();
+                        llvm::BasicBlock* ReallocBB = llvm::BasicBlock::Create(*context_, "realloc_buf", TheFunction);
+                        llvm::BasicBlock* AppendBB  = llvm::BasicBlock::Create(*context_, "append_item", TheFunction);
+
+                        builder_->CreateCondBr(isFull, ReallocBB, AppendBB);
+
+                        builder_->SetInsertPoint(ReallocBB);
+                        // Grow by doubling; bootstrap empty arrays to a
+                        // minimum capacity of 1 so `0 * 2` doesn't leave
+                        // us stuck with a zero-byte buffer forever.
+                        llvm::Value* doubled = builder_->CreateMul(capacity, llvm::ConstantInt::get(i32Ty, 2));
+                        llvm::Value* isEmpty = builder_->CreateICmpEQ(capacity, llvm::ConstantInt::get(i32Ty, 0));
+                        llvm::Value* newCapacity = builder_->CreateSelect(isEmpty, llvm::ConstantInt::get(i32Ty, 1), doubled);
+                        builder_->CreateStore(newCapacity, capPtr);
+
+                        llvm::Value* newSizeBytes = builder_->CreateMul(newCapacity, llvm::ConstantInt::get(i32Ty, 4));
+                        llvm::Value* newSizeBytes64 = builder_->CreateZExt(newSizeBytes, i64Ty);
+
+                        llvm::Value* newBuffer = builder_->CreateCall(getRealloc(), {buffer, newSizeBytes64});
+                        builder_->CreateStore(newBuffer, bufPtrAddr);
+                        builder_->CreateBr(AppendBB);
+
+                        builder_->SetInsertPoint(AppendBB);
+                        // Reload the buffer — realloc may have moved it.
+                        llvm::Value* currentBuffer = builder_->CreateLoad(ptrTy, bufPtrAddr);
+                        llvm::Value* targetPtr = builder_->CreateGEP(i32Ty, currentBuffer, count);
+                        builder_->CreateStore(element.val, targetPtr);
+
+                        llvm::Value* newCount = builder_->CreateAdd(count, llvm::ConstantInt::get(i32Ty, 1));
+                        builder_->CreateStore(newCount, countPtr);
+
+                        return {nullptr, "Void"};
+                    }
 
                     auto sIt = structs_.find(var->typeName);
                     if (sIt == structs_.end()) ThrowTypeError("Type '" + var->typeName + "' has no method '" + methodName + "'");
@@ -1227,9 +1355,41 @@ private:
             TypedValue R = compileExpression(exprArr[3]);
 
             if (L.type != R.type) ThrowTypeError("Operator '" + op + "' cannot be applied to types '" + L.type + "' and '" + R.type + "'");
-            if (L.type != "Int") ThrowTypeError("Mathematical operators only support 'Int' currently.");
 
-            if (op == "+") return {builder_->CreateAdd(L.val, R.val), "Int"};
+            if (op == "+") {
+                if (L.type == "Int") return {builder_->CreateAdd(L.val, R.val), "Int"};
+
+                // FEATURE: Native Heap String Concatenation. When the type
+                // checker sees `String + String` it lowers to a sequence of
+                // libc calls: size the result via `strlen`, grab a fresh
+                // heap buffer with `malloc` (+1 for the null terminator),
+                // then `strcpy` / `strcat` the operands into place. The
+                // resulting pointer is tagged `String` so subsequent ops
+                // flow through the normal C-string path.
+                if (L.type == "String") {
+                    llvm::Value* lenL = builder_->CreateCall(getStrLen(), {L.val});
+                    llvm::Value* lenR = builder_->CreateCall(getStrLen(), {R.val});
+
+                    llvm::Value* totalLen = builder_->CreateAdd(lenL, lenR);
+                    totalLen = builder_->CreateAdd(totalLen, llvm::ConstantInt::get(llvm::Type::getInt64Ty(*context_), 1));
+
+                    llvm::Value* newStr = builder_->CreateCall(getMalloc(), {totalLen});
+
+                    builder_->CreateCall(getStrCpy(), {newStr, L.val});
+                    builder_->CreateCall(getStrCat(), {newStr, R.val});
+
+                    return {newStr, "String"};
+                }
+                ThrowTypeError("Operator '+' is not supported for type '" + L.type + "'");
+            }
+
+            // Arithmetic minus/multiply/divide still require Int operands.
+            // Comparisons below happily accept Bool since Bool shares the
+            // i32 representation with Int.
+            if (op == "-" || op == "*" || op == "/") {
+                if (L.type != "Int") ThrowTypeError("Mathematical operators only support 'Int' currently.");
+            }
+
             if (op == "-") return {builder_->CreateSub(L.val, R.val), "Int"};
             if (op == "*") return {builder_->CreateMul(L.val, R.val), "Int"};
             if (op == "/") {
@@ -1270,6 +1430,7 @@ private:
 }
 
 #include <stdio.h>
+#include <cstring>
 int main(int argc, char** argv) {
     if (argc < 2) return 1;
 
@@ -1285,7 +1446,46 @@ int main(int argc, char** argv) {
     std::ifstream ifs(input_file);
     std::ostringstream ss;
     ss << ifs.rdbuf();
-    std::string source = ss.str();
+
+    // =========================================================================
+    // FEATURE: The Elegant Standard Library (Prelude).
+    //
+    // Just like Swift silently imports its Stdlib module into every file,
+    // we prepend a small set of declarations to every script so users can
+    // call `print`, `printInt`, `fatalError`, and a handful of math helpers
+    // without ever writing an `extern func printf`. The extern declarations
+    // are idempotent: duplicate registrations (for scripts that still bring
+    // their own `extern func printf`) are swallowed by the Extern pass.
+    // =========================================================================
+    std::string stdlib = R"ELEGANT(
+extern func printf(format: String, ...) -> Void
+extern func exit(status: Int) -> Void
+
+// Math Library bindings — the OS math lib is linked in via the JIT's
+// dynamic symbol lookup, so `sqrt` and friends resolve against libm at
+// runtime with no additional setup on the user's part.
+extern func sqrt(x: Float) -> Float
+extern func pow(base: Float, exp: Float) -> Float
+extern func abs(x: Int) -> Int
+
+func print(text: String) {
+    printf(format: "%s\n", text)
+}
+
+func printInt(val: Int) {
+    printf(format: "%d\n", val)
+}
+
+func fatalError(msg: String) {
+    printf(format: "\nFatal Error: %s\n", msg)
+    exit(status: 1)
+}
+)ELEGANT";
+
+    // Stitch the Prelude ahead of the user's source. Line numbers in
+    // diagnostics will be offset by the prelude's length — acceptable
+    // tradeoff for getting a Swift-like zero-import experience.
+    std::string source = stdlib + "\n" + ss.str();
 
     EvoParser::Parser parser;
     EvoParser::ParseContext ctx;
