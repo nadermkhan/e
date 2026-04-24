@@ -1449,6 +1449,58 @@ private:
                     // with a registered type.
                     {
                         std::string resolvedBase = resolveAlias(baseName);
+
+                        // FEATURE: `Memory` intrinsics. These static
+                        // methods have no real function body — we lower
+                        // them directly to LLVM primitives here so the
+                        // i32 `Int` <-> i64 `size_t` mismatch and the
+                        // raw inttoptr / ptrtoint / load / store don't
+                        // leak into the user-visible stdlib.
+                        if (resolvedBase == "Memory") {
+                            llvm::Type* i32Ty = llvm::Type::getInt32Ty(*context_);
+                            llvm::Type* i64Ty = llvm::Type::getInt64Ty(*context_);
+                            llvm::Type* ptrTy = llvm::PointerType::getUnqual(*context_);
+
+                            auto memRequire = [&](size_t n) {
+                                if (EvoParser::isNull(exprArr[2])) ThrowTypeError("Memory." + methodName + " requires " + std::to_string(n) + " argument(s).");
+                                auto argsArr = ctx_->getArrayElements(exprArr[2]);
+                                if (argsArr.size != n) ThrowTypeError("Memory." + methodName + " requires " + std::to_string(n) + " argument(s).");
+                                return argsArr;
+                            };
+
+                            if (methodName == "alloc") {
+                                auto argsArr = memRequire(1);
+                                TypedValue bytes = compileExpression(argsArr[0]);
+                                if (bytes.type != "Int") ThrowTypeError("Memory.alloc expects an Int size.");
+                                llvm::Value* bytes64 = builder_->CreateZExt(bytes.val, i64Ty);
+                                return {builder_->CreateCall(getMalloc(), {bytes64}), "String"};
+                            }
+                            if (methodName == "ptrToInt") {
+                                auto argsArr = memRequire(1);
+                                TypedValue ptr = compileExpression(argsArr[0]);
+                                return {builder_->CreatePtrToInt(ptr.val, i32Ty), "Int"};
+                            }
+                            if (methodName == "intToPtr") {
+                                auto argsArr = memRequire(1);
+                                TypedValue addr = compileExpression(argsArr[0]);
+                                return {builder_->CreateIntToPtr(addr.val, ptrTy), "String"};
+                            }
+                            if (methodName == "peek") {
+                                auto argsArr = memRequire(1);
+                                TypedValue addr = compileExpression(argsArr[0]);
+                                llvm::Value* rawPtr = builder_->CreateIntToPtr(addr.val, ptrTy);
+                                return {builder_->CreateLoad(i32Ty, rawPtr), "Int"};
+                            }
+                            if (methodName == "poke") {
+                                auto argsArr = memRequire(2);
+                                TypedValue addr = compileExpression(argsArr[0]);
+                                TypedValue val  = compileExpression(argsArr[1]);
+                                llvm::Value* rawPtr = builder_->CreateIntToPtr(addr.val, ptrTy);
+                                builder_->CreateStore(val.val, rawPtr);
+                                return {nullptr, "Void"};
+                            }
+                        }
+
                         if (structs_.count(resolvedBase)) {
                             std::string mangledName = resolvedBase + "_" + methodName;
                             auto fit = functions_.find(mangledName);
@@ -1619,7 +1671,7 @@ private:
                     // =====================================================
                     if (var->typeName == "Files" && methodName == "write") {
                         if (EvoParser::isNull(exprArr[2])) ThrowTypeError("Files.write requires one argument.");
-                        auto argsArr = ctx_.getArrayElements(exprArr[2]);
+                        auto argsArr = ctx_->getArrayElements(exprArr[2]);
                         if (argsArr.size != 1) ThrowTypeError("Files.write requires one argument.");
 
                         TypedValue data = compileExpression(argsArr[0]);
@@ -1718,6 +1770,20 @@ private:
                     }
                     return {builder_->CreateCall(fTy, funcPtr, argsV), sig.retType};
                 }
+            }
+        }
+
+        // FEATURE: Unary Minus — negates an Int or Float primary expression.
+        // Lowered to LLVM's `neg` / `fneg` instructions so the IR looks
+        // identical to `0 - x` without the parser contortions.
+        if (nodeType == "Unary") {
+            std::string op = std::string(EvoParser::toString(exprArr[1]));
+            TypedValue expr = compileExpression(exprArr[2]);
+
+            if (op == "-") {
+                if (expr.type == "Int") return {builder_->CreateNeg(expr.val), "Int"};
+                if (expr.type == "Float") return {builder_->CreateFNeg(expr.val), "Float"};
+                ThrowTypeError("Unary operator '-' cannot be applied to type '" + expr.type + "'.");
             }
         }
 
@@ -2003,7 +2069,7 @@ class Memory {
     // only to satisfy the type checker. At lowering time we emit a direct
     // call to the internal `getMalloc()` shim with an i64-zero-extended
     // size argument so we don't collide with the prelude-level extern.
-    func alloc(bytes: Int) -> String { return "" }
+    static func alloc(bytes: Int) -> String { return "" }
 
     static func free(ptr: String) {
         free(ptr: ptr)
@@ -2020,10 +2086,10 @@ class Memory {
     // Known limitation: `Int` is i32 in Elegant, so `ptrToInt` truncates
     // pointers on 64-bit targets and `peek` / `poke` can only address the
     // low 4 GiB. Lifting this requires a language-level `Int64` type.
-    func ptrToInt(ptr: String) -> Int { return 0 }
-    func intToPtr(address: Int) -> String { return "" }
-    func peek(address: Int) -> Int { return 0 }
-    func poke(address: Int, value: Int) {}
+    static func ptrToInt(ptr: String) -> Int { return 0 }
+    static func intToPtr(address: Int) -> String { return "" }
+    static func peek(address: Int) -> Int { return 0 }
+    static func poke(address: Int, value: Int) {}
 }
 
 // `handle` is treated as a C `FILE*` — we hand it straight to fwrite/
@@ -2098,10 +2164,8 @@ class Thread {
 
     static func join(handle: Int) {
         // INFINITE = 0xFFFFFFFF, which is -1 interpreted as a signed 32-bit
-        // integer. The grammar has no unary-minus so we synthesise it via
-        // `0 - 1` to match WaitForSingleObject's signed-milliseconds ABI.
-        var infinite = 0 - 1
-        WaitForSingleObject(handle: handle, milliseconds: infinite)
+        // integer — maps onto WaitForSingleObject's signed-milliseconds ABI.
+        WaitForSingleObject(handle: handle, milliseconds: -1)
     }
 }
 )ELEGANT";
