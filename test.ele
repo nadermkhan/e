@@ -1,18 +1,14 @@
 extern func printf(format: String, ...) -> Void
 
 func main() -> Int {
-    // 1. Dynamic Heap Array Allocation
-    var fib = [0, 1, 0, 0, 0, 0, 0, 0, 0, 0]
-    
-    // 2. Range Iteration & Subscript Pointer Logic
-    for i in 2...9 {
-        fib[i] = fib[i - 1] + fib[i - 2]
+    var primes = [2, 3, 5, 7, 11, 13]
+
+    // The Compiler now knows exactly how long the array is!
+    var max = primes.count - 1
+
+    for i in 0...max {
+        printf(format: "Prime #%d is %d\n", i, primes[i])
     }
-    
-    // 3. Printing the results!
-    for i in 0...9 {
-        printf(format: "fib[%d] = %d\n", i, fib[i])
-    }
-    
-    return 0
+
+    return primes.count
 }

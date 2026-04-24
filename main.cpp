@@ -67,6 +67,19 @@ public:
         return llvm::Function::Create(FT, llvm::Function::ExternalLinkage, "malloc", module_.get());
     }
 
+    // FEATURE: Swift "Fat Pointer" Array Definition
+    // Memory Layout: { i32 capacity, i32 count, i32* buffer_ptr }
+    llvm::StructType* getSwiftArrayType() {
+        if (auto* T = llvm::StructType::getTypeByName(*context_, "SwiftArray")) return T;
+        auto* T = llvm::StructType::create(*context_, "SwiftArray");
+        T->setBody({
+            llvm::Type::getInt32Ty(*context_),
+            llvm::Type::getInt32Ty(*context_),
+            llvm::PointerType::getUnqual(*context_)
+        });
+        return T;
+    }
+
     llvm::Type* getLLVMType(const std::string& typeName) {
         if (typeName == "Int") return llvm::Type::getInt32Ty(*context_);
         if (typeName == "Float") return llvm::Type::getDoubleTy(*context_);
@@ -296,17 +309,25 @@ private:
         if (arr.size > 0) {
             std::string_view nodeType = EvoParser::toString(arr[0]);
             
-            // FEATURE: Array Index Pointer Generation
+            // FEATURE: Swift Array Subscript — Fat Pointer dereferencing
             if (nodeType == "Subscript") {
                 std::string baseName = std::string(EvoParser::toString(arr[1]));
                 llvm::Value* indexVal = compileExpression(arr[2]);
-                
+
                 auto it = named_values_.find(baseName);
                 if (it == named_values_.end()) return nullptr;
-                
+
                 outTypeName = "Int";
-                llvm::Value* heapPtr = builder_->CreateLoad(llvm::PointerType::getUnqual(*context_), it->second.alloca, "array_load");
-                return builder_->CreateGEP(llvm::Type::getInt32Ty(*context_), heapPtr, indexVal, "subscript_ptr");
+
+                // 1. Load the SwiftArray struct pointer from the variable slot.
+                llvm::Value* arrObj = builder_->CreateLoad(llvm::PointerType::getUnqual(*context_), it->second.alloca, "arr_obj");
+
+                // 2. GEP into the struct (field 2) to reach the buffer pointer slot, then load it.
+                llvm::Value* bufPtrAddr = builder_->CreateStructGEP(getSwiftArrayType(), arrObj, 2, "buf_ptr_addr");
+                llvm::Value* bufPtr = builder_->CreateLoad(llvm::PointerType::getUnqual(*context_), bufPtrAddr, "buf_ptr");
+
+                // 3. GEP into the contiguous data buffer using the user's index.
+                return builder_->CreateGEP(llvm::Type::getInt32Ty(*context_), bufPtr, indexVal, "subscript_ptr");
             }
             else if (nodeType == "MemberAccess" || nodeType == "SelfAccess") {
                 std::string baseName, propName;
@@ -512,27 +533,60 @@ private:
             return builder_->CreateGlobalString(val, "str");
         }
 
-        // FEATURE: Create Contiguous Array Memory Block
+        // FEATURE: Swift Array Allocation — build the Fat Pointer
+        // Layout: { i32 capacity, i32 count, i32* buffer_ptr }
         if (nodeType == "ArrayLiteral") {
             std::vector<llvm::Value*> elements;
             if (!EvoParser::isNull(exprArr[1])) {
                 auto argsArr = ctx_.getArrayElements(exprArr[1]);
                 for (const auto& arg : argsArr) elements.push_back(compileExpression(arg));
             }
-            
-            uint64_t bytes = elements.size() * 4; 
-            llvm::Value* sizeVal = llvm::ConstantInt::get(llvm::Type::getInt64Ty(*context_), bytes);
-            llvm::Value* heapPtr = builder_->CreateCall(getMalloc(), {sizeVal}, "array_alloc");
-            
+
+            llvm::StructType* arrTy = getSwiftArrayType();
+            uint64_t structSize = module_->getDataLayout().getTypeAllocSize(arrTy);
+
+            // 1. Malloc the SwiftArray struct (the "fat pointer" object).
+            llvm::Value* arrHeapPtr = builder_->CreateCall(
+                getMalloc(),
+                {llvm::ConstantInt::get(llvm::Type::getInt64Ty(*context_), structSize)},
+                "arr_obj");
+
+            // 2. Malloc the contiguous data buffer (32-bit ints).
+            uint64_t bufSize = elements.size() * 4;
+            llvm::Value* bufHeapPtr = builder_->CreateCall(
+                getMalloc(),
+                {llvm::ConstantInt::get(llvm::Type::getInt64Ty(*context_), bufSize)},
+                "arr_buf");
+
+            // 3. Store Capacity, Count, and Buffer Pointer into the struct.
+            llvm::Value* countConst = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context_), elements.size());
+            builder_->CreateStore(countConst, builder_->CreateStructGEP(arrTy, arrHeapPtr, 0, "cap_ptr"));
+            builder_->CreateStore(countConst, builder_->CreateStructGEP(arrTy, arrHeapPtr, 1, "count_ptr"));
+            builder_->CreateStore(bufHeapPtr, builder_->CreateStructGEP(arrTy, arrHeapPtr, 2, "buf_slot"));
+
+            // 4. Populate the data buffer.
             for (size_t i = 0; i < elements.size(); i++) {
                 llvm::Value* idxVal = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context_), i);
-                llvm::Value* elemPtr = builder_->CreateGEP(llvm::Type::getInt32Ty(*context_), heapPtr, idxVal, "elem_ptr");
+                llvm::Value* elemPtr = builder_->CreateGEP(llvm::Type::getInt32Ty(*context_), bufHeapPtr, idxVal, "elem_ptr");
                 builder_->CreateStore(elements[i], elemPtr);
             }
-            return heapPtr; // Return pointer to start of memory buffer
+            return arrHeapPtr;
         }
 
         if (nodeType == "MemberAccess" || nodeType == "SelfAccess" || nodeType == "Subscript") {
+            // FEATURE: Built-in Swift Array `.count` property.
+            // Checked first so user-defined structs named "Array" still work via the lvalue path.
+            if (nodeType == "MemberAccess") {
+                std::string baseName = std::string(EvoParser::toString(exprArr[1]));
+                std::string propName = std::string(EvoParser::toString(exprArr[2]));
+                auto it = named_values_.find(baseName);
+                if (it != named_values_.end() && it->second.typeName == "Array" && propName == "count") {
+                    llvm::Value* arrObj = builder_->CreateLoad(llvm::PointerType::getUnqual(*context_), it->second.alloca, "arr_obj");
+                    llvm::Value* countPtr = builder_->CreateStructGEP(getSwiftArrayType(), arrObj, 1, "count_ptr");
+                    return builder_->CreateLoad(llvm::Type::getInt32Ty(*context_), countPtr, "count_val");
+                }
+            }
+
             std::string dummyType;
             llvm::Value* ptr = compileLValue(exprVal, dummyType);
             if (!ptr) return nullptr;
