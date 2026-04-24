@@ -1,21 +1,36 @@
+// FEATURE: Polymorphism — Virtual Method Tables (V-Tables) enable dynamic
+// method dispatch at runtime. Methods declared on a subclass override the
+// parent's implementation even when the object is referenced through a
+// variable typed as the parent class.
 extern func printf(format: String, ...) -> Void
 
+class Animal {
+    var health: Int
+
+    func speak() {
+        printf(format: "The Animal makes a generic noise.\n")
+    }
+}
+
+class Dog : Animal {
+    var tailWags: Int
+
+    func speak() {
+        printf(format: "The Dog barks! Health: %d, Tail Wags: %d\n", self.health, self.tailWags)
+    }
+}
+
 func main() -> Int {
-    // 1. The compiler creates a { i1, i32 } Tagged Union Memory Block
-    var age: Int? = 25
+    var d = Dog()
+    d.health = 100
+    d.tailWags = 5
 
-    // 2. The Compiler safely extracts the 25 using LLVM extractvalue
-    printf(format: "The Age is: %d\n", age!)
+    // Upcast to the parent type. The compiler erases Dog-ness at the type
+    // level, but the runtime V-Table on the heap object still points at
+    // Dog_speak — so the next call dynamically resolves to the override.
+    var a: Animal = d
 
-    // 3. The Compiler updates the Union's is_valid flag to FALSE (0)
-    age = nil
-
-    printf(format: "I am about to illegally unwrap a nil variable...\n")
-
-    // 4. THE FATAL TRAP
-    // Instead of crashing the OS with a Segfault, the LLVM engine catches
-    // the false boolean and safely halts the program.
-    var crash: Int = age!
+    a.speak()
 
     return 0
 }

@@ -42,6 +42,18 @@ struct StructInfo {
     std::unordered_map<std::string, std::string> fieldTypesString;
     std::vector<llvm::Type*> fieldTypes;
     bool isReferenceType;
+
+    // FEATURE: Polymorphism — inheritance + Virtual Method Table (V-Table).
+    // Reference-type classes carry a hidden VTable pointer at slot 0 of their
+    // heap layout; method calls on classes route through the VTable so
+    // overrides in subclasses are dispatched dynamically at runtime.
+    std::string superclass;
+    EvoParser::Value astMembers;
+    bool resolved = false;
+    llvm::StructType* vtableType = nullptr;
+    llvm::GlobalVariable* vtableGlobal = nullptr;
+    std::vector<std::string> vtableMethods;                 // vtable slot -> mangled fn name
+    std::unordered_map<std::string, unsigned> vtableIndices; // unmangled method name -> slot
 };
 
 struct VarInfo {
@@ -102,7 +114,7 @@ public:
             if (hasRefs) {
                 llvm::BasicBlock* insertBB = builder_->GetInsertBlock();
                 if (insertBB) {
-                    llvm::Instruction* term = insertBB->getTerminator();
+                    llvm::Instruction* term = insertBB->getTerminatorOrNull();
                     llvm::BasicBlock*         savedBB = insertBB;
                     llvm::BasicBlock::iterator savedIt = builder_->GetInsertPoint();
                     if (term) builder_->SetInsertPoint(term);
@@ -177,13 +189,19 @@ public:
     }
 
     // FEATURE: ARC — emit the native retain/release runtime as LLVM IR.
-    // Every reference-type class stores its ref_count as a hidden Int at
-    // struct offset 0, so we can treat the object pointer as an (i32*) to
-    // load/bump it without any field indexing.
+    // Every reference-type class stores a hidden header at the top of its
+    // heap layout: slot 0 is a VTable pointer (for Polymorphism) and slot 1
+    // is the ref_count. retain/release GEP into slot 1 to bump/drop the
+    // reference counter; release frees the whole allocation when it hits 0.
     void buildARCFunctions() {
         llvm::Type* voidTy = llvm::Type::getVoidTy(*context_);
         llvm::Type* ptrTy  = llvm::PointerType::getUnqual(*context_);
         llvm::Type* i32Ty  = llvm::Type::getInt32Ty(*context_);
+
+        // Canonical header layout shared by every reference-type class.
+        // Using a locally-constructed struct keeps the GEPs well-typed even
+        // though individual subclass StructTypes append extra fields.
+        llvm::StructType* headerTy = llvm::StructType::get(*context_, {ptrTy, i32Ty});
 
         // --- elegant_retain(ptr) ---
         {
@@ -192,10 +210,11 @@ public:
             auto* bb = llvm::BasicBlock::Create(*context_, "entry", retainF);
             llvm::IRBuilder<> B(bb);
 
-            llvm::Value* objPtr = retainF->getArg(0);
-            llvm::Value* count  = B.CreateLoad(i32Ty, objPtr);
-            llvm::Value* incd   = B.CreateAdd(count, llvm::ConstantInt::get(i32Ty, 1));
-            B.CreateStore(incd, objPtr);
+            llvm::Value* objPtr       = retainF->getArg(0);
+            llvm::Value* refCountPtr  = B.CreateStructGEP(headerTy, objPtr, 1);
+            llvm::Value* count        = B.CreateLoad(i32Ty, refCountPtr);
+            llvm::Value* incd         = B.CreateAdd(count, llvm::ConstantInt::get(i32Ty, 1));
+            B.CreateStore(incd, refCountPtr);
             B.CreateRetVoid();
         }
 
@@ -208,10 +227,11 @@ public:
             auto* contBB  = llvm::BasicBlock::Create(*context_, "cont",    releaseF);
             llvm::IRBuilder<> B(entryBB);
 
-            llvm::Value* objPtr = releaseF->getArg(0);
-            llvm::Value* count  = B.CreateLoad(i32Ty, objPtr);
-            llvm::Value* decd   = B.CreateSub(count, llvm::ConstantInt::get(i32Ty, 1));
-            B.CreateStore(decd, objPtr);
+            llvm::Value* objPtr      = releaseF->getArg(0);
+            llvm::Value* refCountPtr = B.CreateStructGEP(headerTy, objPtr, 1);
+            llvm::Value* count       = B.CreateLoad(i32Ty, refCountPtr);
+            llvm::Value* decd        = B.CreateSub(count, llvm::ConstantInt::get(i32Ty, 1));
+            B.CreateStore(decd, refCountPtr);
             llvm::Value* isZero = B.CreateICmpSLE(decd, llvm::ConstantInt::get(i32Ty, 0));
             B.CreateCondBr(isZero, freeBB, contBB);
 
@@ -224,6 +244,122 @@ public:
             B.SetInsertPoint(contBB);
             B.CreateRetVoid();
         }
+    }
+
+    // FEATURE: Polymorphism — structural subtype test for class hierarchies.
+    // `Dog` is-a `Animal` when Dog's superclass chain eventually reaches
+    // Animal. We strip trailing Optional markers so `Dog?` is still an
+    // `Animal?` for assignment / argument compatibility.
+    bool isSubclass(std::string child, std::string parent) {
+        if (!child.empty() && (child.back() == '?' || child.back() == '!')) child.pop_back();
+        if (!parent.empty() && (parent.back() == '?' || parent.back() == '!')) parent.pop_back();
+        if (child == parent) return true;
+        auto it = structs_.find(child);
+        if (it == structs_.end()) return false;
+        const std::string& sup = it->second.superclass;
+        if (sup.empty()) return false;
+        return isSubclass(sup, parent);
+    }
+
+    // FEATURE: Polymorphism — recursive layout resolver.
+    // A subclass inherits every field (after the two-slot header) and every
+    // V-Table entry from its superclass. Overriding a method rewrites the
+    // inherited V-Table slot; new methods append fresh slots. Properties the
+    // subclass declares land after the inherited ones.
+    void resolveLayout(const std::string& name) {
+        auto it = structs_.find(name);
+        if (it == structs_.end()) return;
+        StructInfo& info = it->second;
+        if (info.resolved) return;
+        info.resolved = true;
+
+        llvm::Type* ptrTy = llvm::PointerType::getUnqual(*context_);
+        llvm::Type* i32Ty = llvm::Type::getInt32Ty(*context_);
+
+        unsigned fieldIdx = 0;
+        if (info.isReferenceType) {
+            // Slot 0: V-Table pointer. Slot 1: ref_count.
+            info.fieldTypes.push_back(ptrTy);
+            info.fieldTypesString["__vtable"] = "VTablePtr";
+            info.fieldTypes.push_back(i32Ty);
+            info.fieldTypesString["__ref_count"] = "Int";
+            fieldIdx = 2;
+        }
+
+        if (!info.superclass.empty()) {
+            auto supIt = structs_.find(info.superclass);
+            if (supIt == structs_.end()) {
+                ThrowTypeError("Class '" + name + "' inherits from unknown type '" + info.superclass + "'");
+            }
+            resolveLayout(info.superclass);
+            StructInfo& sup = supIt->second;
+
+            // Inherit V-Table layout wholesale (subclass may override slots).
+            info.vtableMethods = sup.vtableMethods;
+            info.vtableIndices = sup.vtableIndices;
+
+            // Copy parent properties, skipping the two-slot header (already
+            // placed above).
+            for (size_t i = 2; i < sup.fieldTypes.size(); ++i) {
+                info.fieldTypes.push_back(sup.fieldTypes[i]);
+            }
+            for (const auto& [fName, fIdx] : sup.fieldIndices) {
+                if (fIdx >= 2) info.fieldIndices[fName] = fIdx;
+            }
+            for (const auto& [fName, fType] : sup.fieldTypesString) {
+                if (fName != "__vtable" && fName != "__ref_count") {
+                    info.fieldTypesString[fName] = fType;
+                }
+            }
+            fieldIdx = static_cast<unsigned>(info.fieldTypes.size());
+        }
+
+        auto members = ctx_.getArrayElements(info.astMembers);
+        for (const auto& mem : members) {
+            auto memArr = ctx_.getArrayElements(mem);
+            if (memArr.size == 0) continue;
+            std::string_view kind = EvoParser::toString(memArr[0]);
+
+            if (kind == "Property") {
+                std::string propName = std::string(EvoParser::toString(memArr[2]));
+                std::string propType = EvoParser::isNull(memArr[3]) ? "Int" : std::string(EvoParser::toString(memArr[3]));
+                info.fieldIndices[propName] = fieldIdx++;
+                info.fieldTypes.push_back(getLLVMType(propType));
+                info.fieldTypesString[propName] = propType;
+            }
+            else if (kind == "Function") {
+                // Only reference types carry a V-Table; value-type structs
+                // keep static dispatch.
+                if (!info.isReferenceType) continue;
+
+                std::string funcName = std::string(EvoParser::toString(memArr[1]));
+                std::string mangled  = name + "_" + funcName;
+
+                auto slotIt = info.vtableIndices.find(funcName);
+                if (slotIt != info.vtableIndices.end()) {
+                    // Override inherited slot.
+                    info.vtableMethods[slotIt->second] = mangled;
+                } else {
+                    info.vtableIndices[funcName] = static_cast<unsigned>(info.vtableMethods.size());
+                    info.vtableMethods.push_back(mangled);
+                }
+            }
+        }
+
+        if (info.isReferenceType) {
+            std::vector<llvm::Type*> vfuncTypes(info.vtableMethods.size(), ptrTy);
+            info.vtableType = llvm::StructType::create(*context_, name + "_VTable");
+            info.vtableType->setBody(vfuncTypes);
+            info.vtableGlobal = new llvm::GlobalVariable(
+                *module_,
+                info.vtableType,
+                /*isConstant=*/true,
+                llvm::GlobalValue::InternalLinkage,
+                /*Initializer=*/nullptr,
+                name + "_vtable_inst");
+        }
+
+        info.type->setBody(info.fieldTypes);
     }
 
     llvm::StructType* getSwiftArrayType() {
@@ -276,8 +412,44 @@ public:
 
             if (nodeType == "Class" || nodeType == "Struct") {
                 std::string name = std::string(EvoParser::toString(declArr[1]));
-                structs_[name].type = llvm::StructType::create(*context_, name);
-                structs_[name].isReferenceType = (nodeType == "Class");
+                StructInfo& info = structs_[name];
+                info.type = llvm::StructType::create(*context_, name);
+                info.isReferenceType = (nodeType == "Class");
+                info.astMembers = declArr[3];
+
+                // FEATURE: Polymorphism — capture the inheritance clause.
+                // The parser emits superclass as an array of Identifiers so we
+                // accept both the array form and the plain StringView form for
+                // forward-compat. Only classes participate in inheritance.
+                if (nodeType == "Class" && !EvoParser::isNull(declArr[2])) {
+                    auto supVal = declArr[2];
+                    if (supVal.type == EvoParser::ValueType::StringView) {
+                        info.superclass = std::string(EvoParser::toString(supVal));
+                    } else if (supVal.type == EvoParser::ValueType::Array) {
+                        auto supArr = ctx_.getArrayElements(supVal);
+                        if (supArr.size > 0) {
+                            info.superclass = std::string(EvoParser::toString(supArr[0]));
+                        }
+                    }
+                }
+
+                // Register method signatures so Pass 3 can typecheck calls.
+                for (const auto& mem : ctx_.getArrayElements(info.astMembers)) {
+                    auto memArr = ctx_.getArrayElements(mem);
+                    if (memArr.size == 0) continue;
+                    if (EvoParser::toString(memArr[0]) != "Function") continue;
+
+                    std::string mName = name + "_" + std::string(EvoParser::toString(memArr[1]));
+                    FuncSig sig;
+                    sig.argTypes.push_back(name); // Implicit 'self'
+                    if (!EvoParser::isNull(memArr[2])) {
+                        for (const auto& param : ctx_.getArrayElements(memArr[2])) {
+                            sig.argTypes.push_back(std::string(EvoParser::toString(ctx_.getArrayElements(param)[2])));
+                        }
+                    }
+                    sig.retType = EvoParser::isNull(memArr[3]) ? "Void" : std::string(EvoParser::toString(memArr[3]));
+                    functions_[mName] = sig;
+                }
             }
             else if (nodeType == "Extern") {
                 std::string extName = std::string(EvoParser::toString(declArr[1]));
@@ -304,7 +476,8 @@ public:
             }
         }
 
-        // Pass 2: Layouts & Method Signatures
+        // Pass 2a: Register top-level function signatures (Pass 1 handled
+        // methods, structs, classes and externs already).
         for (const auto& declVal : declarations) {
             auto declArr = ctx_.getArrayElements(declVal);
             if (declArr.size == 0) continue;
@@ -321,43 +494,16 @@ public:
                 sig.retType = EvoParser::isNull(declArr[3]) ? "Void" : std::string(EvoParser::toString(declArr[3]));
                 functions_[name] = sig;
             }
-            else if (nodeType == "Class" || nodeType == "Struct") {
-                std::string name = std::string(EvoParser::toString(declArr[1]));
-                StructInfo& info = structs_[name];
-                auto members = ctx_.getArrayElements(declArr[3]);
+        }
 
-                unsigned idx = 0;
-                // FEATURE: ARC — reserve slot 0 for the hidden ref_count Int.
-                // This shifts every user-declared property by one slot, so all
-                // GEPs computed via fieldIndices still point at the right field.
-                if (info.isReferenceType) {
-                    info.fieldTypes.push_back(llvm::Type::getInt32Ty(*context_));
-                    info.fieldTypesString["__ref_count"] = "Int";
-                    idx++;
-                }
-                for (const auto& mem : members) {
-                    auto memArr = ctx_.getArrayElements(mem);
-                    if (EvoParser::toString(memArr[0]) == "Property") {
-                        std::string propName = std::string(EvoParser::toString(memArr[2]));
-                        std::string propType = EvoParser::isNull(memArr[3]) ? "Int" : std::string(EvoParser::toString(memArr[3]));
-                        info.fieldIndices[propName] = idx++;
-                        info.fieldTypes.push_back(getLLVMType(propType));
-                        info.fieldTypesString[propName] = propType;
-                    }
-                    else if (EvoParser::toString(memArr[0]) == "Function") {
-                        std::string mName = name + "_" + std::string(EvoParser::toString(memArr[1]));
-                        FuncSig sig;
-                        sig.argTypes.push_back(name); // Implicit 'self'
-                        if (!EvoParser::isNull(memArr[2])) {
-                            for (const auto& param : ctx_.getArrayElements(memArr[2])) {
-                                sig.argTypes.push_back(std::string(EvoParser::toString(ctx_.getArrayElements(param)[2])));
-                            }
-                        }
-                        sig.retType = EvoParser::isNull(memArr[3]) ? "Void" : std::string(EvoParser::toString(memArr[3]));
-                        functions_[mName] = sig;
-                    }
-                }
-                info.type->setBody(info.fieldTypes);
+        // Pass 2b: Resolve class/struct memory layouts recursively so parent
+        // classes are laid out before their children.
+        for (const auto& declVal : declarations) {
+            auto declArr = ctx_.getArrayElements(declVal);
+            if (declArr.size == 0) continue;
+            std::string_view nodeType = EvoParser::toString(declArr[0]);
+            if (nodeType == "Class" || nodeType == "Struct") {
+                resolveLayout(std::string(EvoParser::toString(declArr[1])));
             }
         }
 
@@ -382,6 +528,28 @@ public:
             }
         }
         popScope();
+
+        // Pass 4: Emit a concrete V-Table global per reference-type class.
+        // Each slot is initialised with a pointer to the final (possibly
+        // overridden) method function. Inherited methods that the subclass
+        // did not override still resolve to the parent's implementation
+        // because the mangled name was copied during resolveLayout.
+        for (auto& [name, info] : structs_) {
+            if (!info.isReferenceType || info.vtableGlobal == nullptr) continue;
+
+            std::vector<llvm::Constant*> funcs;
+            funcs.reserve(info.vtableMethods.size());
+            llvm::Type* ptrTy = llvm::PointerType::getUnqual(*context_);
+            for (const std::string& mName : info.vtableMethods) {
+                llvm::Function* f = module_->getFunction(mName);
+                if (f) {
+                    funcs.push_back(f);
+                } else {
+                    funcs.push_back(llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ptrTy)));
+                }
+            }
+            info.vtableGlobal->setInitializer(llvm::ConstantStruct::get(info.vtableType, funcs));
+        }
     }
 
     void dumpIR() { module_->print(llvm::outs(), nullptr); }
@@ -498,7 +666,7 @@ private:
         popScope();
 
         // Implicit return if none found
-        if (bb->getTerminator() == nullptr) {
+        if (bb->getTerminatorOrNull() == nullptr) {
             if (retTypeName == "Void") builder_->CreateRetVoid();
             else builder_->CreateRet(llvm::ConstantInt::get(*context_, llvm::APInt(32, 0, true)));
         }
@@ -587,19 +755,26 @@ private:
             if (!EvoParser::isNull(stmtArr[3])) varType = std::string(EvoParser::toString(stmtArr[3]));
 
             TypedValue initVal = {nullptr, ""};
+            std::string rhsConstructorType;  // e.g. "Dog" for `= Dog()`
             if (!EvoParser::isNull(stmtArr[4])) {
                 auto rhs = stmtArr[4];
-                // Resolve constructors
+                // Resolve constructors. When the RHS is a bare `Type()` call
+                // we skip compileExpression so the allocation/VTable wiring
+                // below knows which class to build.
                 if (rhs.type == EvoParser::ValueType::Array) {
                     auto rhsArr = ctx_.getArrayElements(rhs);
                     if (EvoParser::toString(rhsArr[0]) == "Call" && rhsArr[1].type == EvoParser::ValueType::StringView) {
                         std::string callee = std::string(EvoParser::toString(rhsArr[1]));
                         if (structs_.count(callee)) {
-                            varType = callee;
+                            rhsConstructorType = callee;
+                            // Infer only when no explicit annotation was given;
+                            // leaving a user-provided annotation intact keeps
+                            // upcasts (`var a: Animal = Dog()`) honest.
+                            if (varType.empty()) varType = callee;
                         }
                     }
                 }
-                if (!structs_.count(varType)) initVal = compileExpression(rhs);
+                if (rhsConstructorType.empty()) initVal = compileExpression(rhs);
             }
 
             // TYPE INFERENCE
@@ -611,8 +786,15 @@ private:
 
             bool isOptional = !varType.empty() && (varType.back() == '?' || varType.back() == '!');
 
-            if (!isOptional && initVal.val != nullptr && initVal.type != varType) {
+            // FEATURE: Polymorphism — allow implicit upcasts on reference
+            // types (e.g. `var a: Animal = Dog()` / `var a: Animal = dog`)
+            // as long as the RHS is a subclass of the annotated type.
+            if (!isOptional && initVal.val != nullptr && initVal.type != varType
+                && !isSubclass(initVal.type, varType)) {
                 ThrowTypeError("Cannot assign type '" + initVal.type + "' to variable of type '" + varType + "'");
+            }
+            if (!rhsConstructorType.empty() && !isSubclass(rhsConstructorType, varType)) {
+                ThrowTypeError("Cannot initialize '" + varType + "' from '" + rhsConstructorType + "()'");
             }
 
             llvm::Type* llvmTy = getLLVMType(varType);
@@ -642,18 +824,42 @@ private:
             }
 
             if (structs_.count(varType)) {
-                if (structs_[varType].isReferenceType) {
-                    uint64_t classSize = module_->getDataLayout().getTypeAllocSize(structs_[varType].type);
-                    llvm::Value* sizeVal = llvm::ConstantInt::get(llvm::Type::getInt64Ty(*context_), classSize);
-                    llvm::Value* heapPtr = builder_->CreateCall(getMalloc(), {sizeVal});
+                StructInfo& info = structs_[varType];
+                if (info.isReferenceType) {
+                    // FEATURE: Polymorphism — upcasting. When the RHS is an
+                    // already-allocated subclass instance we just alias the
+                    // pointer and bump its ref_count; no new allocation.
+                    if (initVal.val != nullptr && isSubclass(initVal.type, varType)) {
+                        builder_->CreateCall(module_->getFunction("elegant_retain"), {initVal.val});
+                        builder_->CreateStore(initVal.val, Alloca);
+                    } else {
+                        // Allocate a fresh instance of the declared concrete
+                        // class (rhsConstructorType when present — else the
+                        // annotation). This determines the heap size AND the
+                        // V-Table that gets wired into slot 0.
+                        std::string concrete = !rhsConstructorType.empty() ? rhsConstructorType : varType;
+                        StructInfo& cls = structs_[concrete];
 
-                    // FEATURE: ARC — initialize the hidden ref_count (slot 0) to 1.
-                    llvm::Value* refCountPtr = builder_->CreateStructGEP(structs_[varType].type, heapPtr, 0);
-                    builder_->CreateStore(
-                        llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context_), 1),
-                        refCountPtr);
+                        uint64_t classSize = module_->getDataLayout().getTypeAllocSize(cls.type);
+                        llvm::Value* sizeVal = llvm::ConstantInt::get(llvm::Type::getInt64Ty(*context_), classSize);
+                        llvm::Value* heapPtr = builder_->CreateCall(getMalloc(), {sizeVal});
 
-                    builder_->CreateStore(heapPtr, Alloca);
+                        // Slot 0: V-Table pointer (Polymorphism).
+                        if (cls.vtableGlobal) {
+                            llvm::Value* vtablePtrAddr = builder_->CreateStructGEP(cls.type, heapPtr, 0);
+                            builder_->CreateStore(cls.vtableGlobal, vtablePtrAddr);
+                        }
+
+                        // Slot 1: ARC ref_count = 1.
+                        llvm::Value* refCountPtr = builder_->CreateStructGEP(cls.type, heapPtr, 1);
+                        builder_->CreateStore(
+                            llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context_), 1),
+                            refCountPtr);
+
+                        builder_->CreateStore(heapPtr, Alloca);
+                    }
+                } else if (initVal.val) {
+                    builder_->CreateStore(initVal.val, Alloca);
                 }
             } else if (initVal.val) {
                 builder_->CreateStore(initVal.val, Alloca);
@@ -688,7 +894,11 @@ private:
                 return;
             }
 
-            if (lhs.type != rhs.type) ThrowTypeError("Cannot assign type '" + rhs.type + "' to '" + lhs.type + "'");
+            // FEATURE: Polymorphism — allow upcasts on reference-type assigns
+            // (`a = dog` where `a: Animal`) as long as `Dog` is-a `Animal`.
+            if (lhs.type != rhs.type && !isSubclass(rhs.type, lhs.type)) {
+                ThrowTypeError("Cannot assign type '" + rhs.type + "' to '" + lhs.type + "'");
+            }
 
             // FEATURE: ARC — reference-type rebinds release the outgoing
             // object and retain the incoming one before the store lands.
@@ -886,7 +1096,12 @@ private:
 
                     for (size_t i = 0; i < argsArr.size; ++i) {
                         TypedValue arg = compileExpression(argsArr[i]);
-                        if (i < sig.argTypes.size() && arg.type != sig.argTypes[i]) {
+                        // FEATURE: Polymorphism — allow subclass upcasts at
+                        // the call boundary so `func f(a: Animal)` accepts a
+                        // Dog without an explicit cast.
+                        if (i < sig.argTypes.size()
+                            && arg.type != sig.argTypes[i]
+                            && !isSubclass(arg.type, sig.argTypes[i])) {
                             ThrowTypeError("Argument " + std::to_string(i+1) + " of '" + callee + "' expected '" + sig.argTypes[i] + "', got '" + arg.type + "'");
                         }
                         argsV.push_back(arg.val);
@@ -904,16 +1119,60 @@ private:
                     auto var = lookupVar(baseName);
                     if (!var) ThrowTypeError("Unknown variable '" + baseName + "'");
 
-                    std::string mangledName = var->typeName + "_" + methodName;
-                    if (!functions_.count(mangledName)) ThrowTypeError("Type '" + var->typeName + "' has no method '" + methodName + "'");
+                    auto sIt = structs_.find(var->typeName);
+                    if (sIt == structs_.end()) ThrowTypeError("Type '" + var->typeName + "' has no method '" + methodName + "'");
+                    StructInfo& info = sIt->second;
 
-                    FuncSig& sig = functions_[mangledName];
-                    std::vector<llvm::Value*> argsV;
-
+                    llvm::Type* ptrTy = llvm::PointerType::getUnqual(*context_);
                     llvm::Value* selfArg = var->alloca;
-                    if (structs_[var->typeName].isReferenceType) {
-                        selfArg = builder_->CreateLoad(llvm::PointerType::getUnqual(*context_), selfArg);
+                    if (info.isReferenceType) {
+                        selfArg = builder_->CreateLoad(ptrTy, selfArg);
+                        // FEATURE: ARC — callees release their `self` at
+                        // scope exit (popScope), so retain before the call
+                        // to keep ref counts balanced across the boundary.
+                        builder_->CreateCall(module_->getFunction("elegant_retain"), {selfArg});
                     }
+
+                    llvm::Value* funcPtr = nullptr;
+                    llvm::FunctionType* fTy = nullptr;
+                    FuncSig sig;
+
+                    if (info.isReferenceType) {
+                        // FEATURE: Polymorphism — dynamic method dispatch.
+                        // Chase the VTable pointer at slot 0 of the object,
+                        // then index into it to pull out the final (possibly
+                        // overridden) function pointer. The actual callee is
+                        // chosen by runtime type, not the declared type.
+                        auto vIt = info.vtableIndices.find(methodName);
+                        if (vIt == info.vtableIndices.end()) {
+                            ThrowTypeError("Type '" + var->typeName + "' has no method '" + methodName + "'");
+                        }
+                        unsigned vIdx = vIt->second;
+
+                        llvm::Value* vptrAddr = builder_->CreateStructGEP(info.type, selfArg, 0);
+                        llvm::Value* vptr     = builder_->CreateLoad(ptrTy, vptrAddr);
+                        llvm::Value* funcPtrAddr = builder_->CreateStructGEP(info.vtableType, vptr, vIdx);
+                        funcPtr = builder_->CreateLoad(ptrTy, funcPtrAddr);
+
+                        const std::string& mangledName = info.vtableMethods[vIdx];
+                        auto fIt = functions_.find(mangledName);
+                        if (fIt == functions_.end()) ThrowTypeError("Missing signature for '" + mangledName + "'");
+                        sig = fIt->second;
+                    } else {
+                        // Static dispatch for value-type structs.
+                        std::string mangledName = var->typeName + "_" + methodName;
+                        auto fIt = functions_.find(mangledName);
+                        if (fIt == functions_.end()) ThrowTypeError("Type '" + var->typeName + "' has no method '" + methodName + "'");
+                        sig = fIt->second;
+                        funcPtr = module_->getFunction(mangledName);
+                    }
+
+                    std::vector<llvm::Type*> argTys;
+                    argTys.reserve(sig.argTypes.size());
+                    for (const auto& t : sig.argTypes) argTys.push_back(getLLVMType(t));
+                    fTy = llvm::FunctionType::get(getLLVMType(sig.retType), argTys, sig.isVarArg);
+
+                    std::vector<llvm::Value*> argsV;
                     argsV.push_back(selfArg);
 
                     if (!EvoParser::isNull(exprArr[2])) {
@@ -921,11 +1180,15 @@ private:
                         for (size_t i = 0; i < argsArr.size; ++i) {
                             TypedValue arg = compileExpression(argsArr[i]);
                             // i+1 because sig.argTypes[0] is 'self'
-                            if (arg.type != sig.argTypes[i+1]) ThrowTypeError("Method argument type mismatch.");
+                            if (i + 1 < sig.argTypes.size()
+                                && arg.type != sig.argTypes[i+1]
+                                && !isSubclass(arg.type, sig.argTypes[i+1])) {
+                                ThrowTypeError("Method argument type mismatch.");
+                            }
                             argsV.push_back(arg.val);
                         }
                     }
-                    return {builder_->CreateCall(module_->getFunction(mangledName), argsV), sig.retType};
+                    return {builder_->CreateCall(fTy, funcPtr, argsV), sig.retType};
                 }
             }
         }
