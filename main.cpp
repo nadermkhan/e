@@ -26,6 +26,9 @@
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
 #include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
 #include <llvm/ExecutionEngine/Orc/ExecutionUtils.h>
+#include <llvm/ExecutionEngine/Orc/AbsoluteSymbols.h>
+#include <llvm/ExecutionEngine/Orc/Shared/ExecutorSymbolDef.h>
+#include <llvm/ExecutionEngine/JITSymbol.h>
 
 #include <ElegantParser.hpp>
 
@@ -111,6 +114,12 @@ public:
         module_ = std::make_unique<llvm::Module>(moduleName, *context_);
         builder_ = std::make_unique<llvm::IRBuilder<>>(*context_);
     }
+
+    // No-op stub that stands in for MinGW's `__main` CRT helper when the
+    // module is executed through the ORC JIT. See executeJIT() for the
+    // rationale. Declared with C linkage so taking its address is ABI-safe
+    // across platforms.
+    static void jitCrtInitStub() {}
 
     // --- SCOPE MANAGEMENT ---
     void pushScope() { scopes_.push_back({}); }
@@ -889,6 +898,30 @@ public:
         module_->setDataLayout(jit->getDataLayout());
         auto processSymbols = llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(jit->getDataLayout().getGlobalPrefix());
         if (processSymbols) jit->getMainJITDylib().addGenerator(std::move(*processSymbols));
+
+        // On Windows/MinGW targets, the backend prepends a call to `__main`
+        // (a CRT hook that runs C++ static constructors) to every function
+        // literally named `main`. That symbol is supplied by libmingw32 at
+        // static link time, but it is not exported from this executable's
+        // image, so GetForCurrentProcess cannot satisfy the reference from
+        // inside the JIT and materialisation fails with "Symbols not found:
+        // [ __main ]". Register a no-op stub in the main dylib so ORC can
+        // resolve the call without dragging in any CRT machinery. On
+        // non-Windows targets the backend never emits the reference, so the
+        // stub sits unused.
+        {
+            llvm::orc::SymbolMap crtStubs;
+            crtStubs[jit->mangleAndIntern("__main")] =
+                llvm::orc::ExecutorSymbolDef(
+                    llvm::orc::ExecutorAddr::fromPtr(
+                        &LLVMCompiler::jitCrtInitStub),
+                    llvm::JITSymbolFlags::Exported |
+                        llvm::JITSymbolFlags::Callable);
+            if (auto err = jit->getMainJITDylib().define(
+                    llvm::orc::absoluteSymbols(std::move(crtStubs)))) {
+                llvm::consumeError(std::move(err));
+            }
+        }
 
         auto tsm = llvm::orc::ThreadSafeModule(std::move(module_), std::move(context_));
         if (auto err = jit->addIRModule(std::move(tsm))) return 1;
