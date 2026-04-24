@@ -1,23 +1,18 @@
 extern func printf(format: String, ...) -> Void
 
-struct Enemy {
-    var hp: Int
-
-    func takeDamage() {
-        self.hp = self.hp - 10
-    }
-}
-
 func main() -> Int {
-    var a = Enemy()
-    a.hp = 100
-
-    var b = a
-
-    b.takeDamage()
-
-    printf(format: "Enemy A health: %d\n", a.hp)
-    printf(format: "Enemy B health: %d\n", b.hp)
-
+    // 1. Dynamic Heap Array Allocation
+    var fib = [0, 1, 0, 0, 0, 0, 0, 0, 0, 0]
+    
+    // 2. Range Iteration & Subscript Pointer Logic
+    for i in 2...9 {
+        fib[i] = fib[i - 1] + fib[i - 2]
+    }
+    
+    // 3. Printing the results!
+    for i in 0...9 {
+        printf(format: "fib[%d] = %d\n", i, fib[i])
+    }
+    
     return 0
 }
