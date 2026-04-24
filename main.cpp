@@ -2755,8 +2755,43 @@ class Thread {
 
         if (compiler.emitObjectFile(obj_file)) {
             std::cout << "\xE2\x9C\x85 Emitted native object: " << obj_file << "\n";
-            std::string linkCmd = "lld-link.exe " + obj_file + " /entry:main /subsystem:console /out:" + exe_file + " /defaultlib:msvcrt.lib /defaultlib:ucrt.lib /defaultlib:kernel32.lib";
-            std::system(linkCmd.c_str());
+
+            // FEATURE: Portable AOT linking.
+            //
+            // The standalone Windows distribution bundles `lld-link.exe`
+            // alongside `elegantc.exe` and ships the MinGW-w64 UCRT64
+            // import libraries (renamed `*.a` -> `*.lib`) in a sibling
+            // `lib/` directory. We locate the compiler's own executable
+            // path via LLVM's cross-platform helper so the AOT driver
+            // works no matter where the user drops the release archive
+            // — no PATH setup, no Visual Studio / Windows SDK required.
+            std::string selfExe =
+                llvm::sys::fs::getMainExecutable(argv[0], (void*)&main);
+            std::filesystem::path exeDir =
+                std::filesystem::path(selfExe).parent_path();
+            std::filesystem::path bundledLinker = exeDir / "lld-link.exe";
+            std::filesystem::path bundledLibs   = exeDir / "lib";
+
+            std::string linker =
+                std::filesystem::exists(bundledLinker)
+                    ? bundledLinker.string()
+                    : std::string("lld-link.exe");
+
+            std::string linkCmd =
+                "\"" + linker + "\" \"" + obj_file + "\""
+                " /entry:main /subsystem:console"
+                " /out:\"" + exe_file + "\""
+                " /libpath:\"" + bundledLibs.string() + "\""
+                " /defaultlib:ucrt.lib"
+                " /defaultlib:kernel32.lib"
+                " /defaultlib:msvcrt.lib";
+
+            int rc = std::system(linkCmd.c_str());
+            if (rc != 0) {
+                std::cerr << "\n\xE2\x9D\x8C  Linker failed (exit "
+                          << rc << "). Command was:\n  " << linkCmd << "\n";
+                return 1;
+            }
         }
     }
     return 0;
