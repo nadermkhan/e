@@ -108,6 +108,12 @@ ReturnStmt "Return" = "return" _ expr:Expression? {
 
 Expression "Expression" = ViewInstantiation / CallExpr / BinaryExpr / PrimaryExpr ;
 
+// FEATURE: The Unwrap Expression (e.g. x!). Negative lookahead on '=' so the
+// postfix '!' never eats the leading '!' of the inequality operator '!='.
+UnwrapExpr "Force Unwrap" = base:(MemberAccess / SubscriptAccess / Identifier) "!" !"=" _ {
+    return createArray(std::vector<EvoParser::Value>{ makeString("ForceUnwrap"), base });
+};
+
 ViewInstantiation "UI Element" = name:Identifier "(" _ args:CallArgs? ")" _ "{" _ children:Expression* "}" _ {
     return createArray(std::vector<EvoParser::Value>{ makeString("ViewNode"), name, args, children });
 };
@@ -129,7 +135,7 @@ BinaryExpr "Binary Operation" = left:PrimaryExpr op:Operator right:Expression {
     return createArray(std::vector<EvoParser::Value>{ makeString("Binary"), op, left, right });
 };
 
-PrimaryExpr "Primary" = Literal / ArrayLiteral / MemberAccess / SubscriptAccess / Identifier / "(" _ @Expression ")" _ ;
+PrimaryExpr "Primary" = UnwrapExpr / Literal / ArrayLiteral / MemberAccess / SubscriptAccess / Identifier / "(" _ @Expression ")" _ ;
 
 ArrayLiteral "Array Literal" = "[" _ elements:CallArgs? "]" _ {
     return createArray(std::vector<EvoParser::Value>{ makeString("ArrayLiteral"), elements });
@@ -145,13 +151,21 @@ MemberAccess "Member Access" = "self." _ prop:Identifier {
     return createArray(std::vector<EvoParser::Value>{ makeString("MemberAccess"), base, prop });
 };
 
-Type "Type" = @Identifier ("?" _ / "!" _)? ; 
+// Capture the Optional/implicitly-unwrapped marker as part of the type name
+// so downstream lowering can detect 'Int?' vs 'Int' etc.
+Type "Type" = @$( [a-zA-Z_] [a-zA-Z0-9_]* ("?" / "!")? ) _ ;
 
 Identifier "Identifier" = @$ ( [a-zA-Z_] [a-zA-Z0-9_]* ) _ ;
 
 Operator "Operator" = @$ ( "==" / "!=" / ">=" / "<=" / ">" / "<" / "+" / "-" / "*" / "/" ) _ ;
 
-Literal "Literal" = StringLiteral / FloatLiteral / IntLiteral / BoolLiteral ;
+Literal "Literal" = NilLiteral / StringLiteral / FloatLiteral / IntLiteral / BoolLiteral ;
+
+// FEATURE: The 'nil' literal. Word-boundary guard so 'nilly' still parses as
+// an Identifier rather than 'nil' followed by garbage.
+NilLiteral "Nil" = "nil" ![a-zA-Z0-9_] _ {
+    return createArray(std::vector<EvoParser::Value>{ makeString("Nil") });
+};
 
 StringLiteral "String" = '"' val:$([^"]*) '"' _ {
     return createArray(std::vector<EvoParser::Value>{ makeString("String"), val }); 
