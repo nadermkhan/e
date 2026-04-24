@@ -1,9 +1,23 @@
-extern func printf(format: String, ...) -> Int
+extern func printf(format: String, ...) -> Void
+
+struct Enemy {
+    var hp: Int
+
+    func takeDamage() {
+        self.hp = self.hp - 10
+    }
+}
 
 func main() -> Int {
-    var greeting = "Hello, World from Elegant Compiler!"
+    var a = Enemy()
+    a.hp = 100
 
-    printf(format: "%s | Number: %d\n", greeting, 2026)
-    
+    var b = a
+
+    b.takeDamage()
+
+    printf(format: "Enemy A health: %d\n", a.hp)
+    printf(format: "Enemy B health: %d\n", b.hp)
+
     return 0
 }
