@@ -152,8 +152,10 @@ MemberAccess "Member Access" = "self." _ prop:Identifier {
 };
 
 // Capture the Optional/implicitly-unwrapped marker as part of the type name
-// so downstream lowering can detect 'Int?' vs 'Int' etc.
-Type "Type" = @$( [a-zA-Z_] [a-zA-Z0-9_]* ("?" / "!")? ) _ ;
+// so downstream lowering can detect 'Int?' vs 'Int' etc. The first alternative
+// accepts function-type annotations like `(Int)->Void` or `(Int,String)->Int`
+// so First-Class Functions can flow through parameters and locals.
+Type "Type" = @$( ( "(" [a-zA-Z0-9_, ]* ")" _ "->" _ [a-zA-Z_] [a-zA-Z0-9_]* ("?" / "!")? ) / ( [a-zA-Z_] [a-zA-Z0-9_]* ("?" / "!")? ) ) _ ;
 
 Identifier "Identifier" = @$ ( [a-zA-Z_] [a-zA-Z0-9_]* ) _ ;
 

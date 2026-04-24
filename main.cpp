@@ -114,7 +114,11 @@ public:
             if (hasRefs) {
                 llvm::BasicBlock* insertBB = builder_->GetInsertBlock();
                 if (insertBB) {
-                    llvm::Instruction* term = insertBB->getTerminator();
+                    // `getTerminator()` in LLVM 23 asserts on ill-formed
+                    // blocks and returns the last instruction unchecked in
+                    // release builds, so we guard with `hasTerminator()`
+                    // and only then pull the real terminator out.
+                    llvm::Instruction* term = insertBB->hasTerminator() ? insertBB->getTerminator() : nullptr;
                     llvm::BasicBlock*         savedBB = insertBB;
                     llvm::BasicBlock::iterator savedIt = builder_->GetInsertPoint();
                     if (term) builder_->SetInsertPoint(term);
@@ -410,6 +414,15 @@ public:
     // struct. Implicitly-unwrapped `T!` is treated identically at the storage
     // level; the force-unwrap runtime check is what makes them different.
     llvm::Type* getLLVMType(const std::string& typeName) {
+        // FEATURE: First-Class Function Pointers. Any type annotation that
+        // contains `->` is a function signature (e.g. `(Int)->Void`). At
+        // the LLVM level we lower it to a raw opaque pointer — a CPU
+        // instruction pointer — so functions can flow through local
+        // variables, parameters, and return values like any other value.
+        if (typeName.find("->") != std::string::npos) {
+            return llvm::PointerType::getUnqual(*context_);
+        }
+
         if (!typeName.empty() && (typeName.back() == '?' || typeName.back() == '!')) {
             std::string baseType = typeName.substr(0, typeName.length() - 1);
             llvm::Type* innerTy = getLLVMType(baseType);
@@ -716,8 +729,13 @@ private:
         // block rather than the entry block so functions whose last statement
         // lowered to a merge block (e.g. a trailing `if`) still get a
         // terminator and pass the IR verifier.
+        // `BasicBlock::getTerminator()` ASSERTS on ill-formed blocks in
+        // debug builds and in release (NDEBUG) just returns the last
+        // instruction regardless of whether it's actually a terminator,
+        // so we must use `hasTerminator()` here to correctly decide
+        // whether an implicit return still needs to be emitted.
         llvm::BasicBlock* tailBB = builder_->GetInsertBlock();
-        if (tailBB && tailBB->getTerminator() == nullptr) {
+        if (tailBB && !tailBB->hasTerminator()) {
             if (retTypeName == "Void") builder_->CreateRetVoid();
             else builder_->CreateRet(llvm::ConstantInt::get(*context_, llvm::APInt(32, 0, true)));
         }
@@ -1056,9 +1074,46 @@ private:
         compileExpression(stmtVal);
     }
 
+    // FEATURE: First-Class Functions — build the canonical signature
+    // string for a named function. This is the textual type that flows
+    // through the rest of the type checker whenever a function is used
+    // as a value: `(Int,String)->Int`, `()->Void`, etc. Kept space-free
+    // so it compares cleanly against parameter annotations captured by
+    // the grammar.
+    std::string buildFuncSigType(const FuncSig& sig) const {
+        std::string s = "(";
+        for (size_t i = 0; i < sig.argTypes.size(); ++i) {
+            s += sig.argTypes[i];
+            if (i + 1 < sig.argTypes.size()) s += ",";
+        }
+        s += ")->" + sig.retType;
+        return s;
+    }
+
+    // FEATURE: First-Class Functions — strip ASCII whitespace from a
+    // captured function-type annotation so `(Int) -> Void` and
+    // `(Int)->Void` compare equal to the synthesised canonical form.
+    static std::string canonicalizeFuncType(std::string s) {
+        std::string out;
+        out.reserve(s.size());
+        for (char c : s) if (c != ' ' && c != '\t') out.push_back(c);
+        return out;
+    }
+
     TypedValue compileExpression(const EvoParser::Value& exprVal) {
         if (exprVal.type == EvoParser::ValueType::StringView) {
             std::string varName = std::string(EvoParser::toString(exprVal));
+
+            // FEATURE: First-Class Functions — resolve a global function
+            // name used as a value expression. `var cb = square` pulls the
+            // function's address out of the module and tags it with the
+            // synthesised `(Int)->Void` signature so the rest of the
+            // compiler can type-check and dispatch it indirectly.
+            if (functions_.count(varName) && module_->getFunction(varName)) {
+                llvm::Function* F = module_->getFunction(varName);
+                return {F, buildFuncSigType(functions_[varName])};
+            }
+
             auto var = lookupVar(varName);
             if (!var) ThrowTypeError("Variable '" + varName + "' used before being declared.");
             return {builder_->CreateLoad(getLLVMType(var->typeName), var->alloca, varName.c_str()), var->typeName};
@@ -1169,6 +1224,43 @@ private:
 
         if (nodeType == "Call") {
             auto targetNode = exprArr[1];
+
+            // FEATURE: First-Class Functions — indirect dispatch. When the
+            // callee name is neither a registered static function nor a
+            // class/struct constructor it must be a local variable holding
+            // a function pointer. Load the pointer, rebuild the LLVM
+            // function type from the variable's signature string, and
+            // emit a CreateCall against the loaded address.
+            if (targetNode.type == EvoParser::ValueType::StringView) {
+                std::string targetName = std::string(EvoParser::toString(targetNode));
+                if (!functions_.count(targetName) && !structs_.count(targetName)) {
+                    TypedValue funcVar = compileExpression(targetNode);
+                    if (funcVar.type.find("->") == std::string::npos) {
+                        ThrowTypeError("Attempted to call '" + targetName + "' which is not a function.");
+                    }
+
+                    // Parse return type out of `(T1,T2,...)->TR`. Canonical
+                    // form is space-free so we can slice directly.
+                    std::string sigStr = canonicalizeFuncType(funcVar.type);
+                    size_t arrowPos = sigStr.find("->");
+                    std::string retType = sigStr.substr(arrowPos + 2);
+
+                    std::vector<llvm::Value*> argsV;
+                    std::vector<llvm::Type*>  argLLTypes;
+                    if (!EvoParser::isNull(exprArr[2])) {
+                        auto argsArr = ctx_.getArrayElements(exprArr[2]);
+                        for (size_t i = 0; i < argsArr.size; ++i) {
+                            TypedValue argVal = compileExpression(argsArr[i]);
+                            argsV.push_back(argVal.val);
+                            argLLTypes.push_back(getLLVMType(argVal.type));
+                        }
+                    }
+
+                    llvm::FunctionType* dynFT = llvm::FunctionType::get(getLLVMType(retType), argLLTypes, false);
+                    return {builder_->CreateCall(dynFT, funcVar.val, argsV), retType};
+                }
+            }
+
             if (targetNode.type == EvoParser::ValueType::StringView) {
                 std::string callee = std::string(EvoParser::toString(targetNode));
                 if (structs_.count(callee)) return {nullptr, ""};
