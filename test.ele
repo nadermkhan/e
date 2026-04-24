@@ -1,14 +1,21 @@
 extern func printf(format: String, ...) -> Void
 
 func main() -> Int {
-    var primes = [2, 3, 5, 7, 11, 13]
+    // 1. The compiler creates a { i1, i32 } Tagged Union Memory Block
+    var age: Int? = 25
 
-    // The Compiler now knows exactly how long the array is!
-    var max = primes.count - 1
+    // 2. The Compiler safely extracts the 25 using LLVM extractvalue
+    printf(format: "The Age is: %d\n", age!)
 
-    for i in 0...max {
-        printf(format: "Prime #%d is %d\n", i, primes[i])
-    }
+    // 3. The Compiler updates the Union's is_valid flag to FALSE (0)
+    age = nil
 
-    return primes.count
+    printf(format: "I am about to illegally unwrap a nil variable...\n")
+
+    // 4. THE FATAL TRAP
+    // Instead of crashing the OS with a Segfault, the LLVM engine catches
+    // the false boolean and safely halts the program.
+    var crash: Int = age!
+
+    return 0
 }

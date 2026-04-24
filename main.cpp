@@ -152,6 +152,30 @@ public:
         return llvm::Function::Create(FT, llvm::Function::ExternalLinkage, "printf", module_.get());
     }
 
+    llvm::Function* getExit() {
+        if (auto* E = module_->getFunction("exit")) return E;
+        auto* FT = llvm::FunctionType::get(llvm::Type::getVoidTy(*context_), {llvm::Type::getInt32Ty(*context_)}, false);
+        return llvm::Function::Create(FT, llvm::Function::ExternalLinkage, "exit", module_.get());
+    }
+
+    // FEATURE: The Safe Panic Trigger. Called automatically when a user tries
+    // to force-unwrap a `nil` Optional. Instead of a hardware segfault the
+    // program halts with a readable diagnostic.
+    llvm::Function* getPanic() {
+        if (auto* F = module_->getFunction("elegant_panic")) return F;
+        auto* FT = llvm::FunctionType::get(llvm::Type::getVoidTy(*context_), false);
+        auto* F = llvm::Function::Create(FT, llvm::Function::InternalLinkage, "elegant_panic", module_.get());
+        auto* BB = llvm::BasicBlock::Create(*context_, "entry", F);
+        llvm::IRBuilder<> b(BB);
+        llvm::Value* msg = b.CreateGlobalString(
+            "\n\033[31m\xF0\x9F\x9A\xA8 Fatal Error:\033[0m Unexpectedly found nil while unwrapping an Optional value.\n",
+            "elegant_panic_msg");
+        b.CreateCall(getPrintf(), {msg});
+        b.CreateCall(getExit(), {llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context_), 1)});
+        b.CreateUnreachable();
+        return F;
+    }
+
     // FEATURE: ARC — emit the native retain/release runtime as LLVM IR.
     // Every reference-type class stores its ref_count as a hidden Int at
     // struct offset 0, so we can treat the object pointer as an (i32*) to
@@ -213,7 +237,17 @@ public:
         return T;
     }
 
+    // FEATURE: Dynamic Tagged Unions for Optionals. A type ending in `?`
+    // lowers to `{ i1 is_valid, T data }` — a standard Swift-style Optional
+    // struct. Implicitly-unwrapped `T!` is treated identically at the storage
+    // level; the force-unwrap runtime check is what makes them different.
     llvm::Type* getLLVMType(const std::string& typeName) {
+        if (!typeName.empty() && (typeName.back() == '?' || typeName.back() == '!')) {
+            std::string baseType = typeName.substr(0, typeName.length() - 1);
+            llvm::Type* innerTy = getLLVMType(baseType);
+            return llvm::StructType::get(*context_, {llvm::Type::getInt1Ty(*context_), innerTy});
+        }
+
         if (typeName == "Int") return llvm::Type::getInt32Ty(*context_);
         if (typeName == "Float") return llvm::Type::getDoubleTy(*context_);
         if (typeName == "String") return llvm::PointerType::getUnqual(*context_);
@@ -570,9 +604,14 @@ private:
 
             // TYPE INFERENCE
             if (varType == "") {
+                if (initVal.type == "Nil") ThrowTypeError("Cannot infer type from 'nil'. Variable '" + varName + "' requires an explicit Optional type annotation.");
                 if (initVal.val == nullptr) ThrowTypeError("Variable '" + varName + "' requires an explicit type or initial value.");
                 varType = initVal.type;
-            } else if (initVal.val != nullptr && initVal.type != varType) {
+            }
+
+            bool isOptional = !varType.empty() && (varType.back() == '?' || varType.back() == '!');
+
+            if (!isOptional && initVal.val != nullptr && initVal.type != varType) {
                 ThrowTypeError("Cannot assign type '" + initVal.type + "' to variable of type '" + varType + "'");
             }
 
@@ -580,6 +619,27 @@ private:
             llvm::Function* TheFunction = builder_->GetInsertBlock()->getParent();
             llvm::AllocaInst* Alloca = CreateEntryBlockAlloca(TheFunction, varName, llvmTy);
             defineVar(varName, {Alloca, varType});
+
+            // FEATURE: Pack standard values into Optional Tagged Unions.
+            // Storage is always { i1 is_valid, T data }; we always store a
+            // fully-formed struct so loads are well-defined.
+            if (isOptional) {
+                llvm::Value* optStruct = llvm::UndefValue::get(llvmTy);
+                if (initVal.type == "Nil" || initVal.val == nullptr) {
+                    optStruct = builder_->CreateInsertValue(optStruct, builder_->getInt1(false), 0);
+                } else if (initVal.type == varType) {
+                    optStruct = initVal.val; // Optional-to-Optional copy
+                } else {
+                    std::string innerType = varType.substr(0, varType.length() - 1);
+                    if (initVal.type != innerType) {
+                        ThrowTypeError("Cannot assign type '" + initVal.type + "' to variable of type '" + varType + "'");
+                    }
+                    optStruct = builder_->CreateInsertValue(optStruct, builder_->getInt1(true), 0);
+                    optStruct = builder_->CreateInsertValue(optStruct, initVal.val, 1);
+                }
+                builder_->CreateStore(optStruct, Alloca);
+                return;
+            }
 
             if (structs_.count(varType)) {
                 if (structs_[varType].isReferenceType) {
@@ -604,6 +664,30 @@ private:
         if (nodeType == "Assign") {
             TypedValue lhs = compileLValue(stmtArr[2]);
             TypedValue rhs = compileExpression(stmtArr[3]);
+
+            bool lhsIsOptional = !lhs.type.empty() && (lhs.type.back() == '?' || lhs.type.back() == '!');
+
+            // FEATURE: Optional assignment — dynamically (re)wrap the RHS
+            // into a tagged-union struct (either `nil`, a direct Optional, or
+            // an auto-promoted base value).
+            if (lhsIsOptional) {
+                llvm::Value* optStruct = llvm::UndefValue::get(getLLVMType(lhs.type));
+                if (rhs.type == "Nil") {
+                    optStruct = builder_->CreateInsertValue(optStruct, builder_->getInt1(false), 0);
+                } else if (rhs.type == lhs.type) {
+                    optStruct = rhs.val;
+                } else {
+                    std::string innerType = lhs.type.substr(0, lhs.type.length() - 1);
+                    if (rhs.type != innerType) {
+                        ThrowTypeError("Cannot assign type '" + rhs.type + "' to variable of type '" + lhs.type + "'");
+                    }
+                    optStruct = builder_->CreateInsertValue(optStruct, builder_->getInt1(true), 0);
+                    optStruct = builder_->CreateInsertValue(optStruct, rhs.val, 1);
+                }
+                builder_->CreateStore(optStruct, lhs.val);
+                return;
+            }
+
             if (lhs.type != rhs.type) ThrowTypeError("Cannot assign type '" + rhs.type + "' to '" + lhs.type + "'");
 
             // FEATURE: ARC — reference-type rebinds release the outgoing
@@ -697,6 +781,38 @@ private:
 
         if (nodeType == "String") {
             return {builder_->CreateGlobalString(std::string(EvoParser::toString(exprArr[1])), "str"), "String"};
+        }
+
+        // FEATURE: The `nil` literal. Carries the special type "Nil" so the
+        // surrounding Property/Assign can wrap it into the correct Optional
+        // struct (a bare `nil` has no intrinsic inner type).
+        if (nodeType == "Nil") return {nullptr, "Nil"};
+
+        // FEATURE: Forced Unwrapping Runtime Safety Checker. Branches on the
+        // Optional's `is_valid` flag and jumps to `elegant_panic` if it's
+        // false, otherwise extracts the payload.
+        if (nodeType == "ForceUnwrap") {
+            TypedValue base = compileExpression(exprArr[1]);
+            if (base.type.empty() || (base.type.back() != '?' && base.type.back() != '!')) {
+                ThrowTypeError("Cannot force-unwrap non-optional type '" + base.type + "'");
+            }
+
+            llvm::Value* isSome = builder_->CreateExtractValue(base.val, 0, "is_some");
+
+            llvm::Function* TheFunction = builder_->GetInsertBlock()->getParent();
+            llvm::BasicBlock* PanicBB = llvm::BasicBlock::Create(*context_, "unwrap_panic", TheFunction);
+            llvm::BasicBlock* ContBB  = llvm::BasicBlock::Create(*context_, "unwrap_cont",  TheFunction);
+
+            builder_->CreateCondBr(isSome, ContBB, PanicBB);
+
+            builder_->SetInsertPoint(PanicBB);
+            builder_->CreateCall(getPanic());
+            builder_->CreateUnreachable();
+
+            builder_->SetInsertPoint(ContBB);
+            std::string innerType = base.type.substr(0, base.type.length() - 1);
+            llvm::Value* innerVal = builder_->CreateExtractValue(base.val, 1, "unwrapped");
+            return {innerVal, innerType};
         }
 
         if (nodeType == "ArrayLiteral") {
