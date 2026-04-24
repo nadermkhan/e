@@ -77,7 +77,50 @@ public:
 
     // --- SCOPE MANAGEMENT ---
     void pushScope() { scopes_.push_back({}); }
-    void popScope() { scopes_.pop_back(); }
+
+    // FEATURE: ARC — release reference-type class variables on scope exit.
+    // Note: this releases every class-typed variable in the current scope,
+    // including function parameters. Callers are therefore expected to have
+    // retained objects they pass in (assignments retain the RHS). Releasing
+    // on scope exit balances the initial ref_count = 1 set at allocation
+    // and subsequent retains performed by assignments.
+    //
+    // If the current basic block was already terminated (e.g. the body ended
+    // with an explicit `return`), we temporarily re-point the builder just
+    // before the terminator so releases run before control leaves the block.
+    void popScope() {
+        llvm::Function* releaseF = module_->getFunction("elegant_release");
+        if (releaseF) {
+            // First check whether this scope contains anything we need to
+            // release; skip all builder manipulation otherwise so we stay a
+            // zero-cost no-op for Int/String/Array-only scopes.
+            bool hasRefs = false;
+            for (auto& [name, var] : scopes_.back()) {
+                auto it = structs_.find(var.typeName);
+                if (it != structs_.end() && it->second.isReferenceType) { hasRefs = true; break; }
+            }
+            if (hasRefs) {
+                llvm::BasicBlock* insertBB = builder_->GetInsertBlock();
+                if (insertBB) {
+                    llvm::Instruction* term = insertBB->getTerminator();
+                    llvm::BasicBlock*         savedBB = insertBB;
+                    llvm::BasicBlock::iterator savedIt = builder_->GetInsertPoint();
+                    if (term) builder_->SetInsertPoint(term);
+
+                    llvm::Type* ptrTy = llvm::PointerType::getUnqual(*context_);
+                    for (auto& [name, var] : scopes_.back()) {
+                        auto it = structs_.find(var.typeName);
+                        if (it == structs_.end() || !it->second.isReferenceType) continue;
+                        llvm::Value* objPtr = builder_->CreateLoad(ptrTy, var.alloca);
+                        builder_->CreateCall(releaseF, {objPtr});
+                    }
+
+                    if (term) builder_->SetInsertPoint(savedBB, savedIt);
+                }
+            }
+        }
+        scopes_.pop_back();
+    }
 
     VarInfo* lookupVar(const std::string& name) {
         for (auto it = scopes_.rbegin(); it != scopes_.rend(); ++it) {
@@ -95,6 +138,68 @@ public:
         if (auto* M = module_->getFunction("malloc")) return M;
         auto* FT = llvm::FunctionType::get(llvm::PointerType::getUnqual(*context_), {llvm::Type::getInt64Ty(*context_)}, false);
         return llvm::Function::Create(FT, llvm::Function::ExternalLinkage, "malloc", module_.get());
+    }
+
+    llvm::Function* getFree() {
+        if (auto* F = module_->getFunction("free")) return F;
+        auto* FT = llvm::FunctionType::get(llvm::Type::getVoidTy(*context_), {llvm::PointerType::getUnqual(*context_)}, false);
+        return llvm::Function::Create(FT, llvm::Function::ExternalLinkage, "free", module_.get());
+    }
+
+    llvm::Function* getPrintf() {
+        if (auto* P = module_->getFunction("printf")) return P;
+        auto* FT = llvm::FunctionType::get(llvm::Type::getInt32Ty(*context_), {llvm::PointerType::getUnqual(*context_)}, true);
+        return llvm::Function::Create(FT, llvm::Function::ExternalLinkage, "printf", module_.get());
+    }
+
+    // FEATURE: ARC — emit the native retain/release runtime as LLVM IR.
+    // Every reference-type class stores its ref_count as a hidden Int at
+    // struct offset 0, so we can treat the object pointer as an (i32*) to
+    // load/bump it without any field indexing.
+    void buildARCFunctions() {
+        llvm::Type* voidTy = llvm::Type::getVoidTy(*context_);
+        llvm::Type* ptrTy  = llvm::PointerType::getUnqual(*context_);
+        llvm::Type* i32Ty  = llvm::Type::getInt32Ty(*context_);
+
+        // --- elegant_retain(ptr) ---
+        {
+            auto* ft = llvm::FunctionType::get(voidTy, {ptrTy}, false);
+            auto* retainF = llvm::Function::Create(ft, llvm::Function::InternalLinkage, "elegant_retain", module_.get());
+            auto* bb = llvm::BasicBlock::Create(*context_, "entry", retainF);
+            llvm::IRBuilder<> B(bb);
+
+            llvm::Value* objPtr = retainF->getArg(0);
+            llvm::Value* count  = B.CreateLoad(i32Ty, objPtr);
+            llvm::Value* incd   = B.CreateAdd(count, llvm::ConstantInt::get(i32Ty, 1));
+            B.CreateStore(incd, objPtr);
+            B.CreateRetVoid();
+        }
+
+        // --- elegant_release(ptr) ---
+        {
+            auto* ft = llvm::FunctionType::get(voidTy, {ptrTy}, false);
+            auto* releaseF = llvm::Function::Create(ft, llvm::Function::InternalLinkage, "elegant_release", module_.get());
+            auto* entryBB = llvm::BasicBlock::Create(*context_, "entry",   releaseF);
+            auto* freeBB  = llvm::BasicBlock::Create(*context_, "free_it", releaseF);
+            auto* contBB  = llvm::BasicBlock::Create(*context_, "cont",    releaseF);
+            llvm::IRBuilder<> B(entryBB);
+
+            llvm::Value* objPtr = releaseF->getArg(0);
+            llvm::Value* count  = B.CreateLoad(i32Ty, objPtr);
+            llvm::Value* decd   = B.CreateSub(count, llvm::ConstantInt::get(i32Ty, 1));
+            B.CreateStore(decd, objPtr);
+            llvm::Value* isZero = B.CreateICmpSLE(decd, llvm::ConstantInt::get(i32Ty, 0));
+            B.CreateCondBr(isZero, freeBB, contBB);
+
+            B.SetInsertPoint(freeBB);
+            llvm::Value* fmt = B.CreateGlobalString("\xE2\x99\xBB\xEF\xB8\x8F  ARC: Object Memory Freed!\n", "arc_free_fmt");
+            B.CreateCall(getPrintf(), {fmt});
+            B.CreateCall(getFree(),   {objPtr});
+            B.CreateBr(contBB);
+
+            B.SetInsertPoint(contBB);
+            B.CreateRetVoid();
+        }
     }
 
     llvm::StructType* getSwiftArrayType() {
@@ -123,6 +228,10 @@ public:
     }
 
     void compile() {
+        // FEATURE: ARC — emit the retain/release runtime into every module
+        // before any user code can reference it.
+        buildARCFunctions();
+
         auto declarations = ctx_.getArrayElements(ctx_.root);
 
         // Pass 1: Type & Signature Registration
@@ -184,6 +293,14 @@ public:
                 auto members = ctx_.getArrayElements(declArr[3]);
 
                 unsigned idx = 0;
+                // FEATURE: ARC — reserve slot 0 for the hidden ref_count Int.
+                // This shifts every user-declared property by one slot, so all
+                // GEPs computed via fieldIndices still point at the right field.
+                if (info.isReferenceType) {
+                    info.fieldTypes.push_back(llvm::Type::getInt32Ty(*context_));
+                    info.fieldTypesString["__ref_count"] = "Int";
+                    idx++;
+                }
                 for (const auto& mem : members) {
                     auto memArr = ctx_.getArrayElements(mem);
                     if (EvoParser::toString(memArr[0]) == "Property") {
@@ -469,6 +586,13 @@ private:
                     uint64_t classSize = module_->getDataLayout().getTypeAllocSize(structs_[varType].type);
                     llvm::Value* sizeVal = llvm::ConstantInt::get(llvm::Type::getInt64Ty(*context_), classSize);
                     llvm::Value* heapPtr = builder_->CreateCall(getMalloc(), {sizeVal});
+
+                    // FEATURE: ARC — initialize the hidden ref_count (slot 0) to 1.
+                    llvm::Value* refCountPtr = builder_->CreateStructGEP(structs_[varType].type, heapPtr, 0);
+                    builder_->CreateStore(
+                        llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context_), 1),
+                        refCountPtr);
+
                     builder_->CreateStore(heapPtr, Alloca);
                 }
             } else if (initVal.val) {
@@ -481,6 +605,17 @@ private:
             TypedValue lhs = compileLValue(stmtArr[2]);
             TypedValue rhs = compileExpression(stmtArr[3]);
             if (lhs.type != rhs.type) ThrowTypeError("Cannot assign type '" + rhs.type + "' to '" + lhs.type + "'");
+
+            // FEATURE: ARC — reference-type rebinds release the outgoing
+            // object and retain the incoming one before the store lands.
+            auto arcIt = structs_.find(rhs.type);
+            if (arcIt != structs_.end() && arcIt->second.isReferenceType) {
+                llvm::Type* ptrTy = llvm::PointerType::getUnqual(*context_);
+                llvm::Value* oldObj = builder_->CreateLoad(ptrTy, lhs.val);
+                builder_->CreateCall(module_->getFunction("elegant_release"), {oldObj});
+                builder_->CreateCall(module_->getFunction("elegant_retain"),  {rhs.val});
+            }
+
             builder_->CreateStore(rhs.val, lhs.val);
             return;
         }
